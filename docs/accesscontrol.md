@@ -1497,6 +1497,36 @@ const record = await directory.getPersonalShares(janeGrantDocId);
 - **What the server sees:** who delegates to whom (grant ids, no names) with
   which right, and the deposit keys' public halves.
 
+**Team databases.** A team mailbox (`tmail_<mailboxId>`) and its team calendar
+(`tcal_<mailboxId>`) belong to a directory group, not to a person. The admin
+gives the group a fixed, random id (8 to 40 lowercase letters and digits),
+stored in clear in the group document so the server can match database ids to
+groups:
+
+```ts
+await directory.setGroupTeamMailboxId("support", "k3v9x2m7q1", adminKey, adminPassword);
+await directory.listTeamMailboxes();   // [{ groupName: "support", mailboxId: "k3v9x2m7q1" }]
+```
+
+- **Members** of the group, also through nested groups, pull and push both
+  databases, including purge requests. The check uses the group as it is on
+  the server now: a member taken out of the group is refused on the next call,
+  and their replica is dropped as for revoked delegates (above).
+- **Depositors.** The mail gateway (`depositPrefixes` with `tmail_` or `tcal_`)
+  and, under `internalMail`, every other member deposit messages (`memo_…`) into
+  the mailbox and invitation requests (`cinv_…`) into the calendar, sealed to a
+  deposit key of the team's key document (userkeys.md §6.8).
+- **The admin** syncs ciphertext, as for personal databases. Nobody else gets
+  anything; without a group carrying the id, nobody but the admin does.
+- **Keys.** As for personal databases, access is not decryption: the team's
+  key document in the database is sealed to the members. Clients keep it in
+  step with the group (add the new members, remove the ones who left, which
+  rotates the key), and repair it after concurrent changes
+  (`recipientsNeedRepair` / `repairRecipients`, userkeys.md §7.5).
+- **Renaming** a group keeps its databases only when the id moves with it:
+  `setGroupTeamMailboxId` on the new name. Ending the team mailbox (`null`)
+  leaves the databases in place, readable only by the admin.
+
 **Free/busy.** Colleagues see when someone is busy without any access to
 their mailbox: the person's client (Haven) publishes only the busy times of
 their calendar, one document per ISO week, into `mbusy_<grantDocId>`. The

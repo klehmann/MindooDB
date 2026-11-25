@@ -64,6 +64,8 @@ import {
   PERSONAL_DATABASE_PREFIX_REGEX,
   personalDatabaseOwner,
   INTERNAL_MAIL_DEPOSIT_PREFIXES,
+  TEAM_MAILBOX_ID_REGEX,
+  isTeamDatabasePrefix,
   recordFromCreateChangeBytes,
 } from "./builtinDbInvariants";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
@@ -158,6 +160,8 @@ interface GroupDocEntry {
   normalizedName: string;
   membersHashes: string[];
   membersEncrypted: string[];
+  /** Team mailbox id (`team_mailbox_id`), when the group is a team mailbox. */
+  teamMailboxId?: string;
   deleted: boolean;
   seenOrder: number;
 }
@@ -262,7 +266,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
 
   // Cache for groups: key -> merged group data (key: lowercase groupName)
   // We store merged data separately to avoid mutating MindooDoc objects.
-  private groupsCache: Map<string, { docId: string; members_hashes: string[]; members_encrypted: string[] }> = new Map();
+  private groupsCache: Map<string, { docId: string; members_hashes: string[]; members_encrypted: string[]; team_mailbox_id?: string }> = new Map();
   // Every group document seen, by doc id. Several documents can carry the same
   // group name (offline creation on two devices); groupsCache is their merge,
   // recomputed per name from this map so an incremental pass that sees only
@@ -1430,6 +1434,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
           normalizedName: normalizedGroupName,
           membersHashes: stringArray(data.members_hashes),
           membersEncrypted: stringArray(data.members_encrypted),
+          ...(typeof data.team_mailbox_id === "string" && data.team_mailbox_id
+            ? { teamMailboxId: data.team_mailbox_id }
+            : {}),
           deleted: doc.isDeleted(),
           seenOrder: ++this.groupDocSeenCounter,
         });
@@ -1579,6 +1586,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
           docId: latest[0],
           members_hashes: Array.from(allMembersHashes),
           members_encrypted: Array.from(allMembersEncrypted),
+          ...(latest[1].teamMailboxId ? { team_mailbox_id: latest[1].teamMailboxId } : {}),
         });
       }
     }
@@ -2653,6 +2661,9 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     if (isAdmin && owner.prefix !== "mbusy_") {
       return { mode: "read", reason: "tenant admin" };
     }
+    if (isTeamDatabasePrefix(owner.prefix)) {
+      return this.evaluateTeamDatabaseAccess(head, owner, input);
+    }
     const grant = await this.loadGrantDocument(owner.grantDocId);
     if (grant && extractActiveKeyPairs(grant).some((pair) => signingKeysEqual(pair.signingPublicKey, input.signingKey))) {
       return { mode: "read", reason: "a device of the owner" };
@@ -2746,6 +2757,57 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       }
     }
     return { mode: "none", reason: grant ? "personal database of another person" : "personal database without a matching grant" };
+  }
+
+  /**
+   * Team mailbox and team calendar (§6.11): `tmail_<mailboxId>` and
+   * `tcal_<mailboxId>` belong to the directory group whose `team_mailbox_id` is
+   * that id. Its members (nested groups included) read and write them; the
+   * mail gateway (`depositPrefixes`) and, under `internalMail`, every member
+   * of the tenant deposit messages and invitation requests.
+   */
+  private async evaluateTeamDatabaseAccess(
+    head: DirectoryStateNode,
+    owner: { prefix: string; grantDocId: string },
+    input: { dbid: string; signingKey: string },
+  ): Promise<{ mode: "read" | "deposit" | "none"; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason: string }> {
+    const group = await this.teamMailboxGroup(owner.grantDocId);
+    if (!group) return { mode: "none", reason: "team database without a group" };
+    const identity = await this.identitySetForSigningKey(input.signingKey, head, { trustedTime: Number.MAX_SAFE_INTEGER });
+    if (identity.groups.map((name) => this.normalizeGroupName(name)).includes(group)) {
+      return { mode: "read", reason: `member of team group ${group}` };
+    }
+    const signerGrants = await this.grantsForSigningKey(input.signingKey);
+    if (signerGrants.length === 0) return { mode: "none", reason: "not a member of the tenant" };
+    const docIdPrefixes = [...(BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES[owner.prefix] ?? [])];
+    const listed = (grant: Record<string, unknown>) =>
+      Array.isArray(grant.depositPrefixes) && (grant.depositPrefixes as unknown[]).includes(owner.prefix);
+    if (signerGrants.some(listed)) {
+      return { mode: "deposit", maxRecipients: 1, docIdPrefixes, reason: `deposit into ${owner.prefix}* granted` };
+    }
+    const mode = head.defaultPolicy?.internalMail ?? "members";
+    let allowed = mode === "members";
+    if (mode === "rules") {
+      const decision = await this.evaluateAccessForSigningKey({
+        op: "doc_deposit",
+        dbid: input.dbid,
+        signingKey: input.signingKey,
+        trustedTime: Number.MAX_SAFE_INTEGER,
+      });
+      allowed = decision.allowed && decision.matchedRuleId !== undefined;
+    }
+    if (!allowed) return { mode: "none", reason: `team database of another group (${mode})` };
+    const limits = head.defaultPolicy?.internalMailLimits ?? {};
+    return {
+      mode: "deposit",
+      maxRecipients: 1,
+      docIdPrefixes,
+      internalMail: {
+        maxBytesPerMail: limits.maxBytesPerMail ?? DEFAULT_INTERNAL_MAIL_LIMITS.maxBytesPerMail,
+        maxMailsPerHour: limits.maxMailsPerHour ?? DEFAULT_INTERNAL_MAIL_LIMITS.maxMailsPerHour,
+      },
+      reason: `internal mail to a team (${mode})`,
+    };
   }
 
   /** The access a delegate gets from the owner's `pbox_` record, or null. */
@@ -5823,6 +5885,68 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     );
     this.groupsCache.delete(normalizedGroupName);
     this.invalidateUnifiedCache();
+  }
+
+  async getGroupTeamMailboxId(groupName: string): Promise<string | null> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    return this.groupsCache.get(this.normalizeGroupName(groupName))?.team_mailbox_id ?? null;
+  }
+
+  async listTeamMailboxes(): Promise<Array<{ groupName: string; mailboxId: string }>> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    const result: Array<{ groupName: string; mailboxId: string }> = [];
+    for (const [groupName, data] of this.groupsCache) {
+      if (data.team_mailbox_id) result.push({ groupName, mailboxId: data.team_mailbox_id });
+    }
+    return result.sort((a, b) => a.groupName.localeCompare(b.groupName));
+  }
+
+  async setGroupTeamMailboxId(
+    groupName: string,
+    mailboxId: string | null,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const normalizedGroupName = this.normalizeGroupName(groupName);
+    if (mailboxId !== null && !TEAM_MAILBOX_ID_REGEX.test(mailboxId)) {
+      throw new Error(`"${mailboxId}" is not a team mailbox id (8 to 40 lowercase letters and digits)`);
+    }
+    const doc = await this.loadGroupDoc(normalizedGroupName);
+    if (!doc) throw new Error(`Group "${normalizedGroupName}" does not exist`);
+    if (mailboxId) {
+      for (const [name, data] of this.groupsCache) {
+        if (name !== normalizedGroupName && data.team_mailbox_id === mailboxId) {
+          throw new Error(`Team mailbox ${mailboxId} already belongs to group "${name}"`);
+        }
+      }
+    }
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
+    await directoryDB.changeDoc(
+      doc,
+      (d: MindooDoc) => {
+        const data = d.getData();
+        // Plain: the server matches team database ids to their group (§6.11).
+        if (mailboxId) data.team_mailbox_id = mailboxId;
+        else delete data.team_mailbox_id;
+      },
+      { signingKeyPair: adminSigningKeyPair, signingKeyPassword: administrationPrivateKeyPassword },
+    );
+    this.groupsCache.delete(normalizedGroupName);
+    this.invalidateUnifiedCache();
+  }
+
+  /** The group whose team mailbox is `mailboxId` (normalized name), or null. */
+  private async teamMailboxGroup(mailboxId: string): Promise<string | null> {
+    await this.updateUnifiedCache();
+    for (const [name, data] of this.groupsCache) {
+      if (data.team_mailbox_id === mailboxId) return name;
+    }
+    return null;
   }
 
   /** The (merged) group's document, or null. */

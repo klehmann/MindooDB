@@ -4657,6 +4657,25 @@ export interface MindooTenantDirectory {
   /** Every group with a mail address: `[{ groupName, address }]`. */
   listGroupMailAddresses?(): Promise<Array<{ groupName: string; address: string }>>;
   /**
+   * The team mailbox id of a group (`tmail_<id>` / `tcal_<id>`), or null when
+   * the group is no team mailbox.
+   */
+  getGroupTeamMailboxId?(groupName: string): Promise<string | null>;
+  /** Every group that is a team mailbox: `[{ groupName, mailboxId }]`. */
+  listTeamMailboxes?(): Promise<Array<{ groupName: string; mailboxId: string }>>;
+  /**
+   * Make a group a team mailbox (a fixed random id, 8 to 40 lowercase letters
+   * and digits) or end that (`null`; the databases stay). Admin-signed. The id
+   * is plain in the group document: the server needs it to decide who may sync
+   * `tmail_<id>` and `tcal_<id>` (§6.11). Keep it when renaming the group.
+   */
+  setGroupTeamMailboxId?(
+    groupName: string,
+    mailboxId: string | null,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+  /**
    * Set or remove (`null`) the mail address of a group. Admin-signed, like the
    * group's members; the group must exist.
    */

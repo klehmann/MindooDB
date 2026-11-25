@@ -12,6 +12,8 @@ This document explains what MindooDB, Haven and Mindoo Mail do with a person's m
 - **Accounts of other providers** (Microsoft 365, Domino, IMAP servers such as GMX): Mindoo Mail mirrors their mail, calendars and contacts into the same storage, so everything is in one place and readable offline.
 - **Delegation**: a person can let a colleague read or edit their mailbox, calendar or contacts, per account, and let them send on their behalf. They can also give access to a service they run themselves, for example an IMAP service so that the mail shows in the mail app of a phone.
 
+- **Team mailboxes**: a shared mailbox for an address such as `support@`, with a team calendar, for the members of a directory group. Everybody in the team sees the same mail and the same state (read, moved, answered); members join and leave by the administrator changing the group.
+
 What does not exist on purpose:
 
 - **"Send as"** without showing who really wrote: a colleague always sends *on behalf of* the owner, and recipients see both names.
@@ -28,6 +30,7 @@ Each person has a few databases of their own, named after their entry in the ten
 | Contacts | contacts and contact groups | the owner, delegates for contacts, the administrator (encrypted only) |
 | Outbox | outgoing mail and its delivery status | the owner, the mail gateway, delegates who may send (only new outgoing mail) |
 | Free/busy | busy times per week, shared calendar weeks | the owner writes; colleagues read |
+| Team mailbox, team calendar | a team's shared mail and appointments | the members of the team's directory group; the mail gateway and colleagues only deliver; the administrator (encrypted only) |
 
 The sync server enforces who may sync each of these databases. Everybody else is refused, even though they are members of the same tenant. Others may only *deliver* into some of them (see §3.3).
 
