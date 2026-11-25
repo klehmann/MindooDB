@@ -20,6 +20,14 @@ import {
 } from "./types";
 import { DocumentDeletedError, DocumentNotFoundError } from "./errors";
 import { entryTrustedTime } from "./storeEntryTime";
+import {
+  PERSONAL_SHARES_DOC_ID_PREFIX,
+  SEND_ON_BEHALF_DOC_ID_PREFIXES,
+  delegatedRight,
+  newestPersonalShares,
+  parsePersonalShares,
+  type PersonalSharesRecord,
+} from "./personalShares";
 import type { StoreEntryMetadata } from "./types";
 import { normalizePublicKeyPem } from "./userkeys/fingerprint";
 import {
@@ -55,6 +63,7 @@ import {
   BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES,
   PERSONAL_DATABASE_PREFIX_REGEX,
   personalDatabaseOwner,
+  INTERNAL_MAIL_DEPOSIT_PREFIXES,
   recordFromCreateChangeBytes,
 } from "./builtinDbInvariants";
 import { KeyBagReconciler } from "./accesscontrol/keyBagReconciler";
@@ -233,6 +242,14 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     byKey: Map<string, DeviceCertRecord[]>;
   } | null = null;
   private buildingDeviceCertIndex: Promise<Map<string, DeviceCertRecord[]>> | null = null;
+  // Delegation records (`pbox_`) read from `userdirectory`, by owner grant id
+  // (docs/accesscontrol.md §6.11, "Delegation").
+  private personalSharesIndex: {
+    stamp: string | null;
+    at: number;
+    byGrant: Map<string, PersonalSharesRecord>;
+  } | null = null;
+  private buildingPersonalSharesIndex: Promise<Map<string, PersonalSharesRecord>> | null = null;
   // Remote-wipe directive index (docs/accesscontrol.md §6.5): signing public key
   // targeted for wipe -> id of the admin-signed grant document carrying the
   // directive. Self-contained key values survive key removal, so this stays
@@ -2110,6 +2127,94 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   }
 
   /**
+   * The delegation record of the person whose grant is `grantDocId`
+   * (docs/accesscontrol.md §6.11, "Delegation"), or null. Only records the
+   * person created themselves count; among several, the highest revision wins.
+   */
+  async getPersonalShares(grantDocId: string): Promise<PersonalSharesRecord | null> {
+    return (await this.loadPersonalSharesIndex()).get(grantDocId) ?? null;
+  }
+
+  /**
+   * The delegation records that list `delegateGrantDocId` as a delegate: whose
+   * mailbox, calendar or contacts this person may sync, and with which right.
+   */
+  async listPersonalSharesDelegatedTo(delegateGrantDocId: string): Promise<PersonalSharesRecord[]> {
+    const index = await this.loadPersonalSharesIndex();
+    return [...index.values()].filter((record) =>
+      record.delegates.some((delegate) => delegate.grant === delegateGrantDocId && Object.keys(delegate.rights).length > 0),
+    );
+  }
+
+  /**
+   * Read every `pbox_` record from the `userdirectory` store without
+   * materializing it, like {@link loadDeviceCertificateIndex}: records are
+   * written once, so the `doc_create` holds the whole record; a delete
+   * withdraws it.
+   */
+  private async loadPersonalSharesIndex(): Promise<Map<string, PersonalSharesRecord>> {
+    if (this.buildingPersonalSharesIndex) return this.personalSharesIndex?.byGrant ?? new Map();
+    const baseTenant = this.tenant as BaseMindooTenant;
+    if (typeof baseTenant.getDocStoreForDb !== "function") return new Map();
+    let store: ReturnType<BaseMindooTenant["getDocStoreForDb"]>;
+    try {
+      store = baseTenant.getDocStoreForDb(USER_DIRECTORY_DB_ID);
+    } catch {
+      return new Map();
+    }
+    const storeHead = await store.getStoreHead?.().catch(() => undefined);
+    const stamp = storeHead ? `${storeHead.epoch}:${storeHead.maxReceiptOrder}` : null;
+    const cached = this.personalSharesIndex;
+    if (cached && stamp !== null && cached.stamp === stamp) return cached.byGrant;
+    if (cached && stamp === null && Date.now() - cached.at < 2000) return cached.byGrant;
+
+    const build = (async () => {
+      const byGrant = new Map<string, PersonalSharesRecord>();
+      const isShares = (m: StoreEntryMetadata): boolean => m.docId.startsWith(PERSONAL_SHARES_DOC_ID_PREFIX);
+      const creates = (await store.findEntries("doc_create", null, null)).filter(isShares);
+      if (creates.length === 0) return byGrant;
+      const deleted = new Set((await store.findEntries("doc_delete", null, null)).filter(isShares).map((m) => m.docId));
+      const live = creates.filter((m) => !deleted.has(m.docId));
+      const entries = await store.getEntries(live.map((m) => m.id));
+      const now = Date.now();
+      const candidates = new Map<string, Array<{ record: PersonalSharesRecord; trustedTime: number; docId: string }>>();
+      for (const entry of entries) {
+        try {
+          const plaintext = await baseTenant.decryptPayload(entry.encryptedData, entry.decryptionKeyId);
+          const record = parsePersonalShares(recordFromCreateChangeBytes(plaintext));
+          if (!record) continue;
+          const meta = live.find((m) => m.id === entry.id) ?? entry;
+          const trustedTime = entryTrustedTime(meta, now);
+          // Only the person whose grant the record names may publish it.
+          const ownerGrant = await this.loadGrantDocument(record.grant);
+          const ownerHash = ownerGrant && typeof ownerGrant.username_hash === "string" ? ownerGrant.username_hash : null;
+          if (!ownerHash) continue;
+          const creatorHash = await this.resolveUsernameHashForSigningKey(entry.createdByPublicKey, trustedTime);
+          if (creatorHash !== ownerHash) continue;
+          const list = candidates.get(record.grant) ?? [];
+          list.push({ record, trustedTime, docId: entry.docId });
+          candidates.set(record.grant, list);
+        } catch {
+          // Not readable here or not a record.
+        }
+      }
+      for (const [grant, list] of candidates) {
+        const best = newestPersonalShares(list);
+        if (best) byGrant.set(grant, best.record);
+      }
+      return byGrant;
+    })();
+    this.buildingPersonalSharesIndex = build;
+    try {
+      const byGrant = await build;
+      this.personalSharesIndex = { stamp, at: Date.now(), byGrant };
+      return byGrant;
+    } finally {
+      this.buildingPersonalSharesIndex = null;
+    }
+  }
+
+  /**
    * The person's device self-grant delegation at the head state
    * (docs/userkeys.md §9), or `null` when the admin never granted it.
    */
@@ -2474,7 +2579,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   async evaluateDbAccessModeForSigningKey(input: {
     dbid: string;
     signingKey: string;
-  }): Promise<{ mode: "read" | "deposit" | "none"; readOnly?: boolean; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason?: string }> {
+  }): Promise<{ mode: "read" | "deposit" | "none"; readOnly?: boolean; writeDocIdPrefixes?: string[]; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason?: string }> {
     // Join requests (docs/invitations.md): tenant admins only, whatever a
     // policy says. The server writes there with its own key, not via sync.
     if (input.dbid === JOIN_REQUESTS_DB_ID) {
@@ -2540,7 +2645,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
   async evaluatePersonalDatabaseAccess(input: {
     dbid: string;
     signingKey: string;
-  }): Promise<{ mode: "read" | "deposit" | "none"; readOnly?: boolean; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason: string } | null> {
+  }): Promise<{ mode: "read" | "deposit" | "none"; readOnly?: boolean; writeDocIdPrefixes?: string[]; maxRecipients?: number; docIdPrefixes?: string[]; internalMail?: Required<InternalMailLimits>; reason: string } | null> {
     const head = await this.getDirectoryStateHead();
     const owner = personalDatabaseOwner(input.dbid, head.defaultPolicy?.personalDatabasePrefixes ?? []);
     if (!owner) return null;
@@ -2569,6 +2674,12 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       Array.isArray(grant[field]) && (grant[field] as unknown[]).includes(owner.prefix);
     if (signerGrants.some((grant) => listed(grant, "accessPrefixes"))) {
       return { mode: "read", reason: `service access to ${owner.prefix}* granted` };
+    }
+    // Delegation (§6.11): the owner's `pbox_` record lets colleagues or a
+    // service sync the mailbox, calendar or contacts, or send on their behalf.
+    if (grant && signerGrants.length > 0) {
+      const delegation = await this.evaluateDelegation(head, owner, input, signerGrants);
+      if (delegation) return delegation;
     }
     // Free/busy (§6.11): other members read the owner's busy times, read-only,
     // under the tenant's `freeBusy` setting. Nobody but the owner writes.
@@ -2608,7 +2719,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     }
     // Internal mail (§6.11): members deposit MindooMail messages into each
     // other's mailbox, under the tenant's `internalMail` setting.
-    if (owner.prefix === "mmail_" && grant && signerGrants.length > 0) {
+    if (INTERNAL_MAIL_DEPOSIT_PREFIXES.includes(owner.prefix) && grant && signerGrants.length > 0) {
       const mode = head.defaultPolicy?.internalMail ?? "members";
       let allowed = mode === "members";
       if (mode === "rules") {
@@ -2625,7 +2736,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
         return {
           mode: "deposit",
           maxRecipients: 1,
-          docIdPrefixes: [...(BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES.mmail_ ?? [])],
+          docIdPrefixes: [...(BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES[owner.prefix] ?? [])],
           internalMail: {
             maxBytesPerMail: limits.maxBytesPerMail ?? DEFAULT_INTERNAL_MAIL_LIMITS.maxBytesPerMail,
             maxMailsPerHour: limits.maxMailsPerHour ?? DEFAULT_INTERNAL_MAIL_LIMITS.maxMailsPerHour,
@@ -2635,6 +2746,38 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
       }
     }
     return { mode: "none", reason: grant ? "personal database of another person" : "personal database without a matching grant" };
+  }
+
+  /** The access a delegate gets from the owner's `pbox_` record, or null. */
+  private async evaluateDelegation(
+    head: Awaited<ReturnType<BaseMindooTenantDirectory["getDirectoryStateHead"]>>,
+    owner: { prefix: string; grantDocId: string },
+    input: { dbid: string; signingKey: string },
+    signerGrants: Array<Record<string, unknown>>,
+  ): Promise<{ mode: "read"; readOnly?: boolean; writeDocIdPrefixes?: string[]; reason: string } | null> {
+    const mode = head.defaultPolicy?.mailDelegation ?? "members";
+    if (mode === "off") return null;
+    const record = await this.getPersonalShares(owner.grantDocId);
+    if (!record) return null;
+    const grantIds = signerGrants
+      .map((grant) => (typeof grant.__grantDocId === "string" ? grant.__grantDocId : null))
+      .filter((id): id is string => !!id);
+    const right = delegatedRight(record, grantIds, owner.prefix);
+    if (!right) return null;
+    if (mode === "rules") {
+      const decision = await this.evaluateAccessForSigningKey({
+        op: "doc_read",
+        dbid: input.dbid,
+        signingKey: input.signingKey,
+        trustedTime: Number.MAX_SAFE_INTEGER,
+      });
+      if (!decision.allowed || decision.matchedRuleId === undefined) return null;
+    }
+    if (right === "read") return { mode: "read", readOnly: true, reason: `delegate (read ${owner.prefix}*)` };
+    if (right === "send") {
+      return { mode: "read", writeDocIdPrefixes: [...SEND_ON_BEHALF_DOC_ID_PREFIXES], reason: `delegate (send via ${owner.prefix}*)` };
+    }
+    return { mode: "read", reason: `delegate (edit ${owner.prefix}*)` };
   }
 
   /** A `grantaccess` document by id, or null (missing, deleted, or another kind of document). */
@@ -2657,7 +2800,7 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     const grants = await this.findGrantAccessDocuments(lookup.username);
     const live = grants
       .filter((doc) => !doc.isDeleted())
-      .map((doc) => doc.getData() as Record<string, unknown>);
+      .map((doc) => ({ ...(doc.getData() as Record<string, unknown>), __grantDocId: doc.getId() }) as Record<string, unknown>);
     const listed = live.filter((data) =>
       extractActiveKeyPairs(data).some((pair) => signingKeysEqual(pair.signingPublicKey, signingKey)),
     );

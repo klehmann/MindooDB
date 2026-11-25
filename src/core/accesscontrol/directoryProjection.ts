@@ -74,6 +74,10 @@ export function parsePolicyDoc(data: Record<string, unknown>): DefaultAccessPoli
     internalMailLimits: parseInternalMailLimits(data.internalMailLimits),
     freeBusy:
       data.freeBusy === "off" || data.freeBusy === "members" || data.freeBusy === "rules" ? data.freeBusy : undefined,
+    mailDelegation:
+      data.mailDelegation === "off" || data.mailDelegation === "members" || data.mailDelegation === "rules"
+        ? data.mailDelegation
+        : undefined,
     freeBusyWeeksAhead:
       typeof data.freeBusyWeeksAhead === "number" && Number.isFinite(data.freeBusyWeeksAhead)
         ? data.freeBusyWeeksAhead

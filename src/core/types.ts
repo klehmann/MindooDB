@@ -1256,6 +1256,19 @@ export interface MindooTenant {
    * (see `SealedValue`). Includes the current user unless
    * `options.includeSelf` is false.
    */
+  /** The grant (`grantaccess` id) this device acts under: `<grantDocId>` of the own personal databases. */
+  getOwnGrantDocId?(): Promise<string | null>;
+  /**
+   * Publish this person's delegation record (docs/accesscontrol.md §6.11,
+   * "Delegation"): delegates and their rights, and the deposit keys. Fields
+   * left out are kept from the previous record.
+   */
+  publishPersonalShares?(input: {
+    depositKeys?: Record<string, import("./personalShares").PersonalShareDepositKey>;
+    delegates?: import("./personalShares").PersonalShareDelegate[];
+  }): Promise<import("./personalShares").PersonalSharesRecord>;
+  /** This person's current delegation record, or null. */
+  getOwnPersonalShares?(): Promise<import("./personalShares").PersonalSharesRecord | null>;
   sealValue?(
     value: Uint8Array,
     recipients: import("./userkeys/sealedTypes").RecipientSpec[],
@@ -1263,6 +1276,12 @@ export interface MindooTenant {
   ): Promise<import("./userkeys/sealedValues").SealedValue>;
   /** Open a `SealedValue` with this identity's keys; null when not a recipient. */
   openSealedValue?(sealed: import("./userkeys/sealedValues").SealedValue): Promise<Uint8Array | null>;
+  /** Deposit keys (userkeys/depositKeys.ts): session-only private halves by fingerprint. */
+  registerDepositUnwrapKey?(fingerprint: string, privateKey: CryptoKey): void;
+  unregisterDepositUnwrapKey?(fingerprint: string): boolean;
+  hasDepositUnwrapKey?(fingerprint: string): boolean;
+  /** Drop the cached generations of a sealed key series. */
+  forgetSealedSeries?(keyId: string): void;
   ingestSealedFromEntries?(
     keyId: string,
     entries: Array<{ recipients?: import("./userkeys/sealedTypes").EntryRecipients; createdAt: number; entryType?: string }>,
@@ -4345,6 +4364,15 @@ export interface MindooTenantDirectory {
    * Deposit and access rights in other people's personal databases (§6.11);
    * fields left out stay as they are.
    */
+  /**
+   * The delegation record (`pbox_`) of the person whose grant is
+   * `grantDocId`: who may sync their personal databases and the deposit keys
+   * depositors seal to (docs/accesscontrol.md §6.11, "Delegation"). Only
+   * records that person created count. Null when there is none.
+   */
+  getPersonalShares?(grantDocId: string): Promise<import("./personalShares").PersonalSharesRecord | null>;
+  /** The delegation records that list `delegateGrantDocId` as a delegate (what was shared with that person). */
+  listPersonalSharesDelegatedTo?(delegateGrantDocId: string): Promise<import("./personalShares").PersonalSharesRecord[]>;
   setGrantPersonalDatabaseRights?(
     username: string,
     rights: { depositPrefixes?: string[]; accessPrefixes?: string[]; depositDocIdPrefixes?: Record<string, string[]> },
@@ -6186,6 +6214,21 @@ export interface MindooDB {
     doc: MindooDoc,
     next: import("./userkeys/sealedTypes").RecipientSpec[],
   ): Promise<AccessDecision>;
+
+  /**
+   * Create a deposit key for a group document of this database
+   * (docs/userkeys.md §6.8): a key pair whose public half depositors seal
+   * deliveries to (`recipients: [{ devicePem }]`), and whose private half is
+   * stored in a document that uses the group's key series, so only the group's
+   * members open the deliveries. The caller must be a member. Rotating means
+   * creating a new one; older ones stay readable for the members.
+   */
+  createDepositKey?(groupDocId: string): Promise<import("./userkeys/depositKeys").DepositKeyInfo>;
+  /**
+   * The deposit keys of this database this replica can read, newest first;
+   * only those of `groupDocId` when given.
+   */
+  listDepositKeys?(groupDocId?: string): Promise<import("./userkeys/depositKeys").DepositKeyInfo[]>;
 
   /**
    * Predict whether deleting `doc` via `deleteDocument` would be allowed by the

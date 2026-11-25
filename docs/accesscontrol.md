@@ -1337,9 +1337,10 @@ any configured policy and even while the master switch is on.
 - **Prefixes.** Built in: `mmail_` (MindooMail's mailbox; the mail gateway
   deposits incoming mail), `mmailout_` (MindooMail's outbox; the person
   writes outgoing mail sealed to themselves and the gateway, the gateway reads
-  it with `accessPrefixes`, sends it and answers with status documents) and
-  `mbusy_` (free/busy, readable by other members, see below)
-  (`BUILTIN_PERSONAL_DATABASE_PREFIXES`). The
+  it with `accessPrefixes`, sends it and answers with status documents),
+  `mbusy_` (free/busy, readable by other members, see below), `mcal_` (the
+  calendar; depositors deliver invitation requests, `cinv_` ids) and `mcon_`
+  (contacts; nobody deposits) (`BUILTIN_PERSONAL_DATABASE_PREFIXES`). The
   tenant default policy can add more with `personalDatabasePrefixes`
   (`["notes_"]`); adding one only ever makes databases more private. A prefix
   is lowercase letters and digits ending in `_`.
@@ -1355,7 +1356,8 @@ any configured policy and even while the master switch is on.
   an empty list takes a right away.
 - **Deposited documents are messages.** In `mmail_` a depositor may only
   create documents whose id starts with `memo_` (MindooMail's message id
-  prefix; `BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES`). Everything else in a
+  prefix; `BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES`), in `mcal_` only
+  invitation requests (`cinv_`). Everything else in a
   mailbox (events, status, folders, settings) therefore is always the owner's
   own, and a client can rely on that without checking authors. The grant can
   set other prefixes per database prefix:
@@ -1398,9 +1400,11 @@ open to every member's sync. Once the server enforces it:
   copy (not implemented yet).
 
 **Internal mail.** Members can mail each other without a mail server: the
-sender's client deposits a MindooMail message, sealed to the recipient only,
+sender's client deposits a MindooMail message, sealed to the recipient only
+(or to the recipient's deposit key, see "Delegation"),
 into the recipient's `mmail_<grantDocId>` (the same deposit semantics as the
-mail gateway, §6.10). It is part of the built-in rule (open core):
+mail gateway, §6.10), and invitation requests (`cinv_`) into their
+`mcal_<grantDocId>`. It is part of the built-in rule (open core):
 
 - **Who.** The tenant default policy's `internalMail`: `"members"` (default:
   every member with a grant, so two users of a new tenant can write to each
@@ -1435,6 +1439,48 @@ await directory.createAccessRule({
   ruleId: "staff_mail", type: "doc_deposit", dbid: "mmail_*", action: "allow", groups: ["staff"],
 }, adminKey, adminPassword);
 ```
+
+**Delegation.** The owner can let colleagues, or a service identity such as
+an IMAP bridge they run, sync their mailbox, calendar and contacts, and send on
+their behalf. The owner publishes one **record** in `userdirectory`, a personal
+document `pbox_…` encrypted with `$publicinfos`, so the sync server enforces it
+and depositors read it:
+
+```ts
+await tenant.publishPersonalShares({
+  delegates: [
+    { grant: bobGrantDocId, rights: { mmail_: "edit", mcal_: "read", mmailout_: "send" } },
+    { grant: imapServiceGrantDocId, rights: { mmail_: "edit" } },
+  ],
+  depositKeys: { mmail_: { publicKey, fingerprint } },   // userkeys.md §6.8
+});
+const record = await directory.getPersonalShares(janeGrantDocId);
+```
+
+- **Rights.** In `mmail_`, `mcal_` and `mcon_`: `"read"` (pull, every push
+  refused) or `"edit"` (pull and push, including purge requests). In
+  `mmailout_`: `"send"` (pull, and create only `mout_` documents: sending
+  jobs the mail gateway sends on the owner's behalf; nothing else). Other
+  personal databases cannot be delegated.
+- **Who decides.** Only records created by a device of the person whose grant
+  the record names count; anyone else's record for them is ignored. Records
+  are written once; a new record (`revision` + 1) replaces the old one, which
+  the owner deletes. Among several, the highest revision wins, then the later
+  trusted time.
+- **Access is not decryption.** The record says who may sync; who can read is
+  decided by the keys. A delegate whose grant is listed but who is not a member
+  of the mailbox's group documents syncs ciphertext. Clients change both
+  together: add to the group and list in the record, or rotate the group and
+  remove from the record.
+- **Revocation.** Takes effect on the server with the next record: the delegate
+  is refused on the next sync call. What they already synced they keep, as
+  everywhere (§13).
+- **Policy.** The tenant default policy's `mailDelegation`: `"members"`
+  (default), `"rules"` (only to members matched by a `doc_read` allow rule
+  for the database) or `"off"` (records ignored). Open core, like the rest of
+  this section.
+- **What the server sees:** who delegates to whom (grant ids, no names) with
+  which right, and the deposit keys' public halves.
 
 **Free/busy.** Colleagues see when someone is busy without any access to
 their mailbox: the person's client (Haven) publishes only the busy times of

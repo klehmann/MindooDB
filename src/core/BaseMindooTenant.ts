@@ -43,7 +43,7 @@ import type {
 } from "./userkeys/types";
 import { currentUserKeyEpoch } from "./userkeys/types";
 import { asUserKeyPayload } from "./userkeys/validateUserKeyDocument";
-import { hasRecipientWraps, isSealedKeyId } from "./userkeys/sealedTypes";
+import { allRecipientWraps, hasRecipientWraps, isSealedKeyId } from "./userkeys/sealedTypes";
 import type { EntryRecipients } from "./userkeys/sealedTypes";
 import { newestRecipientBlock, resolveRecipientSpecs, sealToTargets } from "./userkeys/recipients";
 import type { RecipientOptions, RecipientSpec } from "./userkeys/sealedTypes";
@@ -95,6 +95,8 @@ import { BackgroundTaskTracker } from "./BackgroundTaskTracker";
 import { SingleFlight } from "./utils/singleFlight";
 import { DirectoryAdminKeyResolver } from "./accesscontrol/directoryAdminResolver";
 import { signingKeysEqual } from "./accesscontrol/DirectoryStateNode";
+import { extractActiveKeyPairs } from "./accesscontrol/grantKeys";
+import * as shares from "./personalShares";
 import { namedExport } from "./utils/dynamicImportInterop";
 
 /**
@@ -208,6 +210,13 @@ export class BaseMindooTenant implements MindooTenant {
    * (see {@link ingestForkedSealedCreates}).
    */
   private readonly sealedForkKeys = new Map<string, Map<string, Uint8Array[]>>();
+  /**
+   * Private halves of deposit keys this session can open, by fingerprint
+   * (see userkeys/depositKeys.ts). Held in memory only, like the sealed series:
+   * a database registers one when it can read the deposit key document and
+   * unregisters it when it loses access to the group.
+   */
+  private readonly depositUnwrapKeys = new Map<string, CryptoKey>();
 
   // Local cache support
   private cacheManager: CacheManager | null = null;
@@ -742,7 +751,131 @@ export class BaseMindooTenant implements MindooTenant {
     return [
       ...(await this.userKeys.getUserKeyCryptoKeysForReconcile(options)),
       await this.getEncryptionPrivateKeyForReconcile(),
+      ...this.depositUnwrapKeys.values(),
     ].filter((k): k is CryptoKey => !!k);
+  }
+
+  /**
+   * The grant (`grantaccess` document id) this device acts under: the
+   * `<grantDocId>` of the current user's personal databases, or null.
+   */
+  async getOwnGrantDocId(): Promise<string | null> {
+    const me = await this.getCurrentUserId();
+    const directory = await this.openDirectory();
+    const grants = await directory.findGrantAccessDocuments!(me.username);
+    const live = grants.filter((doc) => !doc.isDeleted());
+    const mine = live.find((doc) => {
+      const data = doc.getData() as Record<string, unknown>;
+      return extractActiveKeyPairs(data).some((pair) => signingKeysEqual(pair.signingPublicKey, me.userSigningPublicKey));
+    });
+    return (mine ?? live[0])?.getId() ?? null;
+  }
+
+  /**
+   * Publish who may sync this person's mailbox, calendar, contacts and outbox,
+   * and the deposit keys depositors seal to (docs/accesscontrol.md §6.11,
+   * "Delegation"). Replaces the previous record (a new one with the next
+   * revision; older ones of this person are deleted). The record is
+   * `$publicinfos`: the sync server enforces it and the mail gateway reads the
+   * deposit keys. Who can decrypt is decided by the group documents in those
+   * databases, which the caller updates together with this.
+   */
+  async publishPersonalShares(input: {
+    depositKeys?: Record<string, shares.PersonalShareDepositKey>;
+    delegates?: shares.PersonalShareDelegate[];
+  }): Promise<shares.PersonalSharesRecord> {
+    const grant = await this.getOwnGrantDocId();
+    if (!grant) throw new Error("publishPersonalShares: no grant for the current user");
+    const own = await this.listOwnPersonalShareDocs(grant);
+    const current = shares.newestPersonalShares(own);
+    const record: shares.PersonalSharesRecord = {
+      form: shares.PERSONAL_SHARES_FORM,
+      grant,
+      revision: (current?.record.revision ?? 0) + 1,
+      depositKeys: input.depositKeys ?? current?.record.depositKeys ?? {},
+      delegates: input.delegates ?? current?.record.delegates ?? [],
+      writtenAt: Date.now(),
+    };
+    shares.validatePersonalShares(record);
+    const db = await this.openDB(USER_DIRECTORY_DB_ID);
+    await db.createDocument({
+      idPrefix: shares.PERSONAL_SHARES_DOC_ID_PREFIX.slice(0, -1),
+      decryptionKeyId: PUBLIC_INFOS_KEY_ID,
+      initialValues: JSON.parse(JSON.stringify(record)) as Record<string, unknown>,
+    });
+    for (const old of own) {
+      try {
+        await db.deleteDocument(old.docId);
+      } catch {
+        // already gone
+      }
+    }
+    return record;
+  }
+
+  /** This person's current delegation record from the local `userdirectory`, or null. */
+  async getOwnPersonalShares(): Promise<shares.PersonalSharesRecord | null> {
+    const grant = await this.getOwnGrantDocId();
+    if (!grant) return null;
+    return shares.newestPersonalShares(await this.listOwnPersonalShareDocs(grant))?.record ?? null;
+  }
+
+  private async listOwnPersonalShareDocs(
+    grant: string,
+  ): Promise<Array<{ record: shares.PersonalSharesRecord; trustedTime: number; docId: string }>> {
+    const db = await this.openDB(USER_DIRECTORY_DB_ID);
+    await db.syncStoreChanges();
+    const directory = await this.openDirectory();
+    const me = await this.getCurrentUserId();
+    const ownHash = await directory.resolveUsernameHashForSigningKey!(me.userSigningPublicKey, Number.MAX_SAFE_INTEGER);
+    if (!ownHash) return [];
+    const result: Array<{ record: shares.PersonalSharesRecord; trustedTime: number; docId: string }> = [];
+    for (const id of await db.getAllDocumentIds()) {
+      if (!id.startsWith(shares.PERSONAL_SHARES_DOC_ID_PREFIX)) continue;
+      try {
+        const doc = await db.getDocument(id);
+        if (doc.isDeleted()) continue;
+        const record = shares.parsePersonalShares(doc.getData() as Record<string, unknown>);
+        // Only records of this person (the personal-document rule keeps
+        // others from changing them, not from creating their own).
+        if (!record || record.grant !== grant) continue;
+        const create = (await db.getStore().findNewEntriesForDoc([], id)).find((m) => m.entryType === "doc_create");
+        if (!create) continue;
+        const creatorHash = await directory.resolveUsernameHashForSigningKey!(create.createdByPublicKey, Number.MAX_SAFE_INTEGER);
+        if (!creatorHash || creatorHash !== ownHash) continue;
+        result.push({ record, trustedTime: entryTrustedTime(create, Date.now()), docId: id });
+      } catch {
+        // unreadable
+      }
+    }
+    return result;
+  }
+
+  /** Makes deliveries sealed to the deposit key `fingerprint` readable in this session. */
+  registerDepositUnwrapKey(fingerprint: string, privateKey: CryptoKey): void {
+    this.depositUnwrapKeys.set(fingerprint, privateKey);
+  }
+
+  /** Forgets a deposit key (the group was left); returns whether it was held. */
+  unregisterDepositUnwrapKey(fingerprint: string): boolean {
+    return this.depositUnwrapKeys.delete(fingerprint);
+  }
+
+  hasDepositUnwrapKey(fingerprint: string): boolean {
+    return this.depositUnwrapKeys.has(fingerprint);
+  }
+
+  /**
+   * Drops the cached generations of a sealed key series, so the next ingest
+   * decides access again from the wraps (used when a deposit key was given up).
+   */
+  forgetSealedSeries(keyId: string): void {
+    this.sealedGenerations.delete(keyId);
+    this.sealedEpochs.delete(keyId);
+    this.sealedBlocks.delete(keyId);
+    this.sealedDeep.delete(keyId);
+    this.sealedExplored.delete(keyId);
+    this.sealedForkKeys.delete(keyId);
   }
 
   /**
@@ -763,6 +896,11 @@ export class BaseMindooTenant implements MindooTenant {
     recipients: EntryRecipients,
     keys: CryptoKey[],
   ): Promise<Array<{ epoch: number; key: Uint8Array }> | null> {
+    // A deposit key is known by fingerprint: try it first when a wrap names it.
+    const preferred = allRecipientWraps(recipients)
+      .map((wrap) => this.depositUnwrapKeys.get(wrap.keyFingerprint))
+      .filter((key): key is CryptoKey => !!key);
+    if (preferred.length > 0) keys = [...preferred, ...keys.filter((key) => !preferred.includes(key))];
     for (const key of keys) {
       try {
         return await openBundleRange({ crypto: this.cryptoAdapter, recipients, privateKey: key });

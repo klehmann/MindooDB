@@ -107,6 +107,8 @@ export type ServerDbAccessModeEvaluator = (
 ) => Promise<{
   mode: "read" | "deposit" | "none";
   readOnly?: boolean;
+  /** With `"read"`: pushes only for documents whose id starts with one of these (send on behalf, §6.11). */
+  writeDocIdPrefixes?: string[];
   maxRecipients?: number;
   docIdPrefixes?: string[];
   internalMail?: { maxBytesPerMail: number; maxMailsPerHour: number };
@@ -219,6 +221,8 @@ type ResolvedTokenPayload = NetworkAuthTokenPayload & {
   };
   /** Set for a principal that may read this database but not write it (free/busy readers, §6.11). */
   readOnly?: boolean;
+  /** Set for a principal that may write only documents with these id prefixes (send on behalf, §6.11). */
+  writeDocIdPrefixes?: string[];
 };
 
 /** Optional access-control wiring for the server store (docs/accesscontrol.md §5–§7). */
@@ -1469,6 +1473,20 @@ export class ServerNetworkContentAddressedStore {
         continue;
       }
 
+      // Send on behalf (§6.11, "Delegation"): only documents of the allowed kinds.
+      if (
+        tokenPayload.writeDocIdPrefixes?.length &&
+        !tokenPayload.writeDocIdPrefixes.some((prefix) => entry.docId.startsWith(prefix))
+      ) {
+        this.rejectEntry(
+          rejected,
+          entry.id,
+          `Entry ${entry.id}: this user may only write ${tokenPayload.writeDocIdPrefixes.join(", ")} documents in database "${this.witnessDbid ?? this.localStore.getId()}"`,
+          "policy",
+        );
+        continue;
+      }
+
       // Purge requests in personal databases (§6.11): only by someone who may
       // read the database, only for documents that are already deleted.
       // Independent of the ACL master switch, like the builtin invariants.
@@ -2151,6 +2169,9 @@ export class ServerNetworkContentAddressedStore {
       }
       if (access.readOnly) {
         return { ...payload, readOnly: true };
+      }
+      if (access.writeDocIdPrefixes?.length) {
+        return { ...payload, writeDocIdPrefixes: access.writeDocIdPrefixes };
       }
     } else if (this.dbAccessEvaluator) {
       const dbid = this.witnessDbid ?? this.localStore.getId();

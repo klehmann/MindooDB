@@ -602,6 +602,57 @@ await db.revealHistory(group, ["CN=carol/O=contoso"]);
   byte-identical to before. A reader's series is the union of the newest block (which
   decides membership) and the older blocks it can open.
 
+### 6.8 Deposit keys: delivering to a group without reading it
+
+A group document's key series is symmetric: whoever can encrypt with it can
+decrypt everything encrypted with it. A writer that must deliver to a group
+but never read it (a mail gateway delivering into a mailbox that the owner
+shares with a colleague) needs an asymmetric half. A **deposit key** is an
+RSA-OAEP key pair for exactly that:
+
+```ts
+const group = await db.createDocument({ recipients: ["CN=bob/O=contoso"], initialValues: { name: "Mailbox" } });
+const key = await db.createDepositKey(group.getId());   // { docId, publicKeyPem, fingerprint, ... }
+
+// The depositor (another identity, which cannot read the database):
+await depositorDb.createDocument({
+  idPrefix: "memo",
+  recipients: [{ devicePem: key.publicKeyPem, label: "mailbox" }],
+  recipientOptions: { includeSelf: false },
+  initialValues: { subject: "Hello" },
+});
+```
+
+- **Where the private half lives.** In a document of the same database,
+  `dkey_<fingerprint>`, encrypted with the group's key series. Only members of
+  the group can open it, and with it every delivery sealed to its public half.
+  The id is derived from the fingerprint, so a reader that meets a wrap it
+  cannot open finds the matching deposit key by id without decrypting anything,
+  and a document cannot claim a key it does not hold (the fingerprint of the
+  public key in it must match its id).
+- **Members and history.** A member added with the history reads every deposit
+  key and therefore every delivery. A member added with `history: "none"`
+  cannot open deposit keys written before they joined, so they do not read
+  older deliveries; create a new deposit key after such an addition and hand
+  depositors its public half.
+- **Removal.** Removing a member rotates the group (§6.3); create a new deposit
+  key as well. The removed member's replica gives up the deposit keys together
+  with the group, so the deliveries disappear from it like the group's other
+  documents. Deliveries that a depositor still seals to the old key stay
+  readable for the remaining members, because the old deposit key document
+  stays.
+- **Rotation** is creating a new deposit key; old ones are never changed.
+  `listDepositKeys(groupDocId?)` lists those this replica can read, newest
+  first.
+- **The depositor's view.** A delivery is an ordinary sealed document with one
+  wrap. The writing session keeps the document key it generated until it is
+  restarted, as for every `includeSelf: false` document; it cannot read any
+  other delivery.
+- **Publishing the public half** to depositors is up to the application; for
+  personal databases MindooDB has a record for it (docs/accesscontrol.md
+  §6.11, "Delegation").
+- The private halves are held in memory per session, never in the KeyBag.
+
 ## 7) Architecture
 
 This section is for engineers who need to reason about correctness, concurrency, and failure behaviour rather than just call the API.

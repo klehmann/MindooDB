@@ -104,3 +104,10 @@ export {
   type SelfGrantKeyRecord,
   type SelfGrantKeyRecordPayload,
 } from "./selfGrantKeyRecord";
+export {
+  DEPOSIT_KEY_DOC_PREFIX,
+  DEPOSIT_KEY_FORM,
+  depositKeyDocId,
+  isDepositKeyDocId,
+  type DepositKeyInfo,
+} from "./depositKeys";
