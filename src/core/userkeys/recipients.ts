@@ -272,6 +272,8 @@ export async function sealToTargets(input: {
   generations: Uint8Array[];
   targets: ResolvedWrapTarget[];
   epoch: number;
+  /** Keys of concurrent rotations for whole-history readers (see EntryRecipients.extra). */
+  extra?: Array<{ epoch: number; key: Uint8Array }>;
 }): Promise<EntryRecipients> {
   const crypto = input.tenant.getCryptoAdapter();
   const runFrom = Math.max(1, input.epoch - input.generations.length + 1);
@@ -296,6 +298,9 @@ export async function sealToTargets(input: {
     crypto,
     generations: slice(mainFrom),
     wrapsTo: wrapsOf(byFrom.get(mainFrom) ?? []),
+    // Only the whole-history bundle carries them: a reader with a history limit
+    // must not get keys of older epochs through this side door.
+    extra: mainFrom <= 1 ? input.extra?.filter((entry) => entry.epoch >= mainFrom) : undefined,
   });
   sealed.epoch = input.epoch;
   if (mainFrom > 1) sealed.bundleFrom = mainFrom;

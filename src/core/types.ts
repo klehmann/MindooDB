@@ -6211,6 +6211,27 @@ export interface MindooDB {
     options?: import("./userkeys/sealedTypes").RecipientChangeOptions,
   ): Promise<import("./userkeys/sealedTypes").RecipientChangeResult>;
   /**
+   * Whether a sealed document's key blocks went apart through concurrent
+   * recipient changes (two members changed the list while offline), and how:
+   * `forked` when two blocks share the newest epoch, `missing` for current
+   * readers without a wrap in the newest block (added in a branch that lost),
+   * `stale` for removed readers who still have one. Null when nothing is to
+   * repair or this replica cannot tell (it does not hold the document key).
+   * The caller decides when to call {@link repairRecipients}; any reader may.
+   */
+  recipientsNeedRepair?(doc: MindooDoc): Promise<import("./userkeys/sealedTypes").RecipientRepairNeed | null>;
+  /**
+   * Seals the document key once more for exactly the current readers, with a
+   * new generation, after concurrent recipient changes
+   * ({@link recipientsNeedRepair}). Keys of the concurrent branches go into
+   * the new block, so readers added later read what was written in either
+   * branch. Removed readers cannot read anything written afterwards.
+   */
+  repairRecipients?(
+    doc: MindooDoc,
+    options?: import("./userkeys/sealedTypes").RecipientChangeOptions,
+  ): Promise<import("./userkeys/sealedTypes").RecipientChangeResult>;
+  /**
    * Drop readers from a sealed document. Rotates the document key: removed
    * readers keep what they already have, and cannot read later changes.
    * Names are canonicalized and matched case-insensitively.
