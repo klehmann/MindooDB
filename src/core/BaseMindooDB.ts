@@ -247,6 +247,7 @@ import {
   ENCRYPT_FOR_FIELD,
   DEFAULT_RECIPIENT_HISTORY,
   groupKeyDocIdOf,
+  allRecipientWraps,
   isSealedKeyId,
   sealedKeyDocId,
   sealedKeyId,
@@ -255,6 +256,16 @@ import {
   type RecipientChangeResult,
   type RecipientSpec,
 } from "./userkeys/sealedTypes";
+import {
+  DEPOSIT_KEY_DOC_PREFIX,
+  depositKeyDocId,
+  depositKeyInfoOf,
+  generateDepositKey,
+  importDepositPrivateKey,
+  isDepositKeyDocId,
+  type DepositKeyInfo,
+} from "./userkeys/depositKeys";
+import { fingerprintPublicKeyPem } from "./userkeys/fingerprint";
 import type { LocalCacheStore } from "./cache/LocalCacheStore";
 import type { ICacheable } from "./cache/CacheManager";
 import type { CacheManager } from "./cache/CacheManager";
@@ -7163,8 +7174,20 @@ export class BaseMindooDB implements MindooDB {
       await this.tenant.ingestSealedFromEntries(keyId, entries);
       // A document encrypted with a group document's key series (`groupKeyDocId`)
       // carries no recipient block of its own: the wraps are on the group document.
-      if (isSealedKeyId(keyId) && !newestRecipientBlock(entries)) {
+      const newestBlock = isSealedKeyId(keyId) ? newestRecipientBlock(entries) : undefined;
+      if (isSealedKeyId(keyId) && !newestBlock) {
         await this.ingestGroupKey(keyId);
+      }
+      // A delivery sealed to a deposit key: open it with the key's private half
+      // when this replica can read the deposit key document (userkeys/depositKeys.ts).
+      if (newestBlock && !(await this.tenant.hasDecryptionKey(keyId))) {
+        if (await this.loadDepositKeysFor(newestBlock)) {
+          await this.tenant.ingestSealedFromEntries(keyId, entries);
+        }
+      }
+      const entryDocId = (entries[0] as { docId?: string } | undefined)?.docId;
+      if (entryDocId && isDepositKeyDocId(entryDocId)) {
+        this.depositKeyDocsSeen.add(entryDocId);
       }
       // A series that does not reach back to epoch 1 may be completed from the
       // key document's older recipient blocks; `entries` is often just a batch.
@@ -7200,6 +7223,112 @@ export class BaseMindooDB implements MindooDB {
    * next {@link reconcileGroupKeyAccess} re-runs the key visibility reconcile.
    */
   private groupKeyAccessChanged = new Set<string>();
+
+  /** Deposit key documents seen in this pass (loaded at its end, see reconcileDepositKeys). */
+  private depositKeyDocsSeen = new Set<string>();
+  /** Deposit keys this database registered with the tenant: fingerprint -> group key id. */
+  private depositKeysRegistered = new Map<string, string>();
+  /** Fingerprints without a readable deposit key document, by time of the miss (ms). */
+  private depositKeyMisses = new Map<string, number>();
+  private static readonly DEPOSIT_KEY_MISS_TTL_MS = 2000;
+  private loadingDepositKeys = false;
+
+  /**
+   * For a sealed block this replica could not open: registers the deposit keys
+   * named by its wraps whose documents this replica can read. True when one
+   * was registered (the block should be tried again).
+   */
+  private async loadDepositKeysFor(block: EntryRecipients): Promise<boolean> {
+    if (this.loadingDepositKeys) return false;
+    this.loadingDepositKeys = true;
+    try {
+      let registered = false;
+      for (const wrap of allRecipientWraps(block)) {
+        if (wrap.kind !== "device") continue;
+        const fingerprint = wrap.keyFingerprint;
+        if (this.tenant.hasDepositUnwrapKey(fingerprint)) continue;
+        const missed = this.depositKeyMisses.get(fingerprint);
+        if (missed !== undefined && Date.now() - missed < BaseMindooDB.DEPOSIT_KEY_MISS_TTL_MS) continue;
+        if (await this.registerDepositKeyDoc(depositKeyDocId(fingerprint))) {
+          registered = true;
+        } else {
+          this.depositKeyMisses.set(fingerprint, Date.now());
+        }
+      }
+      return registered;
+    } finally {
+      this.loadingDepositKeys = false;
+    }
+  }
+
+  /** Reads a deposit key document and registers its private half; false when not readable. */
+  private async registerDepositKeyDoc(docId: string): Promise<string | null> {
+    const metas = await this.scanAllMetadata(this.store, { docId });
+    const create = metas.find((meta) => meta.entryType === "doc_create");
+    if (!create) return null;
+    const groupKeyId = create.decryptionKeyId;
+    if (!isSealedKeyId(groupKeyId)) return null;
+    await this.ingestGroupKey(groupKeyId);
+    if (!(await this.tenant.hasDecryptionKey(groupKeyId))) return null;
+    let data: Record<string, unknown>;
+    try {
+      const internalDoc = await this.loadDocumentInternal(docId);
+      if (!internalDoc || internalDoc.isDeleted) return null;
+      data = this.wrapDocument(internalDoc).getData() as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+    // The key must belong to the group whose series encrypts its document.
+    const info = depositKeyInfoOf(docId, data);
+    if (!info || sealedKeyId(info.groupDocId) !== groupKeyId) return null;
+    const imported = await importDepositPrivateKey(this.tenant.getCryptoAdapter(), docId, data).catch(() => null);
+    if (!imported) return null;
+    this.tenant.registerDepositUnwrapKey(imported.info.fingerprint, imported.privateKey);
+    this.depositKeysRegistered.set(imported.info.fingerprint, groupKeyId);
+    this.depositKeyMisses.delete(imported.info.fingerprint);
+    return imported.info.fingerprint;
+  }
+
+  /**
+   * End of a pass: registers deposit keys that became readable and gives up
+   * those of groups this replica left, then reveals or hides the deliveries
+   * sealed to them.
+   */
+  private async reconcileDepositKeys(): Promise<void> {
+    const changed = new Set<string>();
+    if (this.depositKeyDocsSeen.size > 0) {
+      const seen = [...this.depositKeyDocsSeen];
+      this.depositKeyDocsSeen.clear();
+      for (const docId of seen) {
+        const known = [...this.depositKeysRegistered.keys()].some((fp) => depositKeyDocId(fp) === docId);
+        if (known) continue;
+        const fingerprint = await this.registerDepositKeyDoc(docId);
+        if (fingerprint) changed.add(fingerprint);
+      }
+    }
+    for (const [fingerprint, groupKeyId] of [...this.depositKeysRegistered]) {
+      if (await this.tenant.hasDecryptionKey(groupKeyId)) continue;
+      this.depositKeysRegistered.delete(fingerprint);
+      this.tenant.unregisterDepositUnwrapKey(fingerprint);
+      changed.add(fingerprint);
+    }
+    if (changed.size === 0) return;
+    // The deliveries sealed to these keys: their key series follow the deposit key.
+    const keyIds = new Set<string>();
+    for (const meta of await this.scanAllMetadata(this.store)) {
+      if (meta.entryType !== "doc_create" || !isSealedKeyId(meta.decryptionKeyId)) continue;
+      const wraps = allRecipientWraps(meta.recipients);
+      if (wraps.some((wrap) => changed.has(wrap.keyFingerprint))) keyIds.add(meta.decryptionKeyId);
+    }
+    if (keyIds.size === 0) return;
+    for (const keyId of keyIds) {
+      // Given up: drop the cached series so the wraps decide again.
+      const lost = [...changed].some((fp) => !this.depositKeysRegistered.has(fp));
+      if (lost) this.tenant.forgetSealedSeries(keyId);
+    }
+    this.groupKeyMisses.clear();
+    await this.reconcileKeyVisibilityOf(keyIds);
+  }
 
   /** Per document: whether its origin decrypted with the partial series held then. */
   private partialSeriesProbes = new Map<string, boolean>();
@@ -7280,6 +7409,7 @@ export class BaseMindooDB implements MindooDB {
    * almost every sync batch.
    */
   private async reconcileGroupKeyAccess(): Promise<void> {
+    if (!this.isTimeTravelMode()) await this.reconcileDepositKeys();
     if (this.groupKeyAccessChanged.size === 0 || this.isTimeTravelMode()) return;
     const keyIds = new Set(this.groupKeyAccessChanged);
     this.groupKeyAccessChanged.clear();
@@ -16208,6 +16338,42 @@ export class BaseMindooDB implements MindooDB {
     options?: RecipientChangeOptions,
   ): Promise<RecipientChangeResult> {
     return this.mutateRecipients(doc, "set", recipients, options);
+  }
+
+  async createDepositKey(groupDocId: string): Promise<DepositKeyInfo> {
+    const { info, fields } = await generateDepositKey(this.tenant.getCryptoAdapter(), groupDocId, Date.now());
+    await this.createDocument({
+      id: info.docId,
+      assumeUniqueId: true,
+      groupKeyDocId: groupDocId,
+      initialValues: fields,
+    });
+    const imported = await importDepositPrivateKey(this.tenant.getCryptoAdapter(), info.docId, fields);
+    if (imported) {
+      this.tenant.registerDepositUnwrapKey(info.fingerprint, imported.privateKey);
+      this.depositKeysRegistered.set(info.fingerprint, sealedKeyId(groupDocId));
+    }
+    return info;
+  }
+
+  async listDepositKeys(groupDocId?: string): Promise<DepositKeyInfo[]> {
+    await this.syncStoreChanges();
+    const keys: DepositKeyInfo[] = [];
+    for (const docId of await this.getAllDocumentIds()) {
+      if (!docId.startsWith(DEPOSIT_KEY_DOC_PREFIX)) continue;
+      try {
+        const doc = await this.getDocument(docId);
+        const info = depositKeyInfoOf(docId, doc.getData() as Record<string, unknown>);
+        if (!info || (groupDocId && info.groupDocId !== groupDocId)) continue;
+        if (doc.getDecryptionKeyId() !== sealedKeyId(info.groupDocId)) continue;
+        const actual = await fingerprintPublicKeyPem(info.publicKeyPem, this.tenant.getCryptoAdapter().getSubtle());
+        if (actual !== info.fingerprint) continue;
+        keys.push(info);
+      } catch {
+        // not readable
+      }
+    }
+    return keys.sort((left, right) => right.createdAt - left.createdAt || left.docId.localeCompare(right.docId));
   }
 
   async revealHistory(

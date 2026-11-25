@@ -375,6 +375,17 @@ llm?: LlmEndpointPolicy;
    */
   freeBusy?: "off" | "members" | "rules";
   /**
+   * Delegation of personal databases (§6.11, "Delegation"): whether a member
+   * may let colleagues (or a service identity) sync their mailbox
+   * (`mmail_`), calendar (`mcal_`) and contacts (`mcon_`), and send on their
+   * behalf through `mmailout_`, by listing them in their `pbox_` record in
+   * `userdirectory`. `"members"` (default): every member may delegate to
+   * every member. `"rules"`: only to members matched by a `doc_read` allow
+   * rule for the database (e.g. `dbid: "mmail_*"`, a group). `"off"`: no
+   * delegation; the records are ignored. Tenant default policy only.
+   */
+  mailDelegation?: "off" | "members" | "rules";
+  /**
    * How many weeks ahead clients publish free/busy times (default 12, clamped
    * to 1..52, see {@link effectiveFreeBusyWeeksAhead}). Not enforced by the
    * server; clients read it from the policy.
@@ -513,6 +524,7 @@ export const DEFAULT_POLICY_DEFAULTS: Required<
     | "internalMail"
     | "internalMailLimits"
     | "freeBusy"
+    | "mailDelegation"
     | "freeBusyWeeksAhead"
     | "calendarShareMax"
     | "calendarShareDefault"
@@ -865,6 +877,14 @@ export function validateAccessPolicy(
     throw new Error(`freeBusy "${String(policy.freeBusy)}" must be "off", "members" or "rules"`);
   }
   if (
+    policy.mailDelegation !== undefined &&
+    policy.mailDelegation !== "off" &&
+    policy.mailDelegation !== "members" &&
+    policy.mailDelegation !== "rules"
+  ) {
+    throw new Error(`mailDelegation "${String(policy.mailDelegation)}" must be "off", "members" or "rules"`);
+  }
+  if (
     policy.freeBusyWeeksAhead !== undefined &&
     (!Number.isInteger(policy.freeBusyWeeksAhead) || policy.freeBusyWeeksAhead < 1 || policy.freeBusyWeeksAhead > 52)
   ) {
@@ -1136,6 +1156,7 @@ export function effectivePolicy(
     | "internalMail"
     | "internalMailLimits"
     | "freeBusy"
+    | "mailDelegation"
     | "freeBusyWeeksAhead"
     | "calendarShareMax"
     | "calendarShareDefault"

@@ -670,3 +670,16 @@ export {
 
 // Invitation links and the join-request inbox (docs/invitations.md)
 export * from "./joinrequests";
+
+// Delegation of personal databases (docs/accesscontrol.md §6.11, "Delegation")
+export {
+  PERSONAL_SHARES_DOC_ID_PREFIX,
+  PERSONAL_SHARES_FORM,
+  DELEGABLE_PERSONAL_DATABASES,
+  SEND_ON_BEHALF_DOC_ID_PREFIXES,
+  delegatedRight,
+  type PersonalShareRight,
+  type PersonalShareDelegate,
+  type PersonalShareDepositKey,
+  type PersonalSharesRecord,
+} from "./personalShares";
