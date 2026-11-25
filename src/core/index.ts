@@ -686,3 +686,6 @@ export {
   type PersonalShareDepositKey,
   type PersonalSharesRecord,
 } from "./personalShares";
+
+// Deposit keys of team mailboxes (docs/accesscontrol.md §6.11, "Team databases")
+export { TEAM_SHARES_DOC_ID_PREFIX, TEAM_SHARES_FORM, type TeamSharesRecord } from "./teamShares";

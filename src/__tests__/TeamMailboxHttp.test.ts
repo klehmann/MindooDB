@@ -207,11 +207,23 @@ describe("team mailbox on a real server (HTTP)", () => {
     // Carol is no member: no sync.
     await expect(pull(t.tenants.carol, dbId)).rejects.toThrow(DENIED);
 
-    // The gateway delivers, sealed to the deposit key; members read it.
+    // Jane publishes the deposit key; a record by Carol (no member) is ignored.
+    await t.tenants.carol.publishTeamShares!(mailboxId, { tmail_: { publicKey: "forged", fingerprint: "ff:ff" } });
+    await push(t.tenants.carol, USER_DIRECTORY_DB_ID);
+    await t.tenants.jane.publishTeamShares!(mailboxId, {
+      tmail_: { publicKey: depositKey.publicKeyPem, fingerprint: depositKey.fingerprint },
+    });
+    await push(t.tenants.jane, USER_DIRECTORY_DB_ID);
+    await pull(t.tenants.gateway, USER_DIRECTORY_DB_ID);
+    const gatewayDirectory = (await t.tenants.gateway.openDirectory()) as MindooTenantDirectory;
+    const published = await gatewayDirectory.getTeamShares!(mailboxId);
+    expect(published?.depositKeys.tmail_?.fingerprint).toBe(depositKey.fingerprint);
+
+    // The gateway delivers, sealed to the published deposit key; members read it.
     const gatewayDb = await openDb(t.tenants.gateway, dbId);
     await gatewayDb.createDocument({
       idPrefix: "memo",
-      recipients: [{ devicePem: depositKey.publicKeyPem, label: "deposit" }],
+      recipients: [{ devicePem: published!.depositKeys.tmail_!.publicKey, label: "deposit" }],
       recipientOptions: { includeSelf: false },
       initialValues: { text: "from outside" },
     });

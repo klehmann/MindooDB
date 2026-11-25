@@ -57,7 +57,7 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * and audit refused writes while the hoster still sees ciphertext. Ownership is
  * the creator either way.
  */
-export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_", "rpp_", "sgk_", "pbox_"] as const;
+export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_", "rpp_", "sgk_", "pbox_", "tbox_"] as const;
 
 /** Is this a personal-data document id inside `userdirectory`? */
 export function isPersonalUserdirectoryDocId(docId: string | undefined | null): boolean {

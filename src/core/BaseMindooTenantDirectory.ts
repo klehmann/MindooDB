@@ -28,6 +28,7 @@ import {
   parsePersonalShares,
   type PersonalSharesRecord,
 } from "./personalShares";
+import { TEAM_SHARES_DOC_ID_PREFIX, newestTeamShares, parseTeamShares, type TeamSharesRecord } from "./teamShares";
 import type { StoreEntryMetadata } from "./types";
 import { normalizePublicKeyPem } from "./userkeys/fingerprint";
 import {
@@ -2220,6 +2221,44 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     } finally {
       this.buildingPersonalSharesIndex = null;
     }
+  }
+
+  async getTeamShares(mailboxId: string): Promise<TeamSharesRecord | null> {
+    const group = await this.teamMailboxGroup(mailboxId);
+    if (!group) return null;
+    const baseTenant = this.tenant as BaseMindooTenant;
+    if (typeof baseTenant.getDocStoreForDb !== "function") return null;
+    let store: ReturnType<BaseMindooTenant["getDocStoreForDb"]>;
+    try {
+      store = baseTenant.getDocStoreForDb(USER_DIRECTORY_DB_ID);
+    } catch {
+      return null;
+    }
+    const isShares = (m: StoreEntryMetadata): boolean => m.docId.startsWith(TEAM_SHARES_DOC_ID_PREFIX);
+    const creates = (await store.findEntries("doc_create", null, null)).filter(isShares);
+    if (creates.length === 0) return null;
+    const deleted = new Set((await store.findEntries("doc_delete", null, null)).filter(isShares).map((m) => m.docId));
+    const live = creates.filter((m) => !deleted.has(m.docId));
+    const head = await this.getDirectoryStateHead();
+    const now = Date.now();
+    const candidates: Array<{ record: TeamSharesRecord; trustedTime: number; docId: string }> = [];
+    for (const entry of await store.getEntries(live.map((m) => m.id))) {
+      try {
+        const plaintext = await baseTenant.decryptPayload(entry.encryptedData, entry.decryptionKeyId);
+        const record = parseTeamShares(recordFromCreateChangeBytes(plaintext));
+        if (!record || record.mailboxId !== mailboxId) continue;
+        // Only a current member of the team's group may publish its keys.
+        const identity = await this.identitySetForSigningKey(entry.createdByPublicKey, head, {
+          trustedTime: Number.MAX_SAFE_INTEGER,
+        });
+        if (!identity.groups.map((name) => this.normalizeGroupName(name)).includes(group)) continue;
+        const meta = live.find((m) => m.id === entry.id) ?? entry;
+        candidates.push({ record, trustedTime: entryTrustedTime(meta, now), docId: entry.docId });
+      } catch {
+        // Not readable here or not a record.
+      }
+    }
+    return newestTeamShares(candidates)?.record ?? null;
   }
 
   /**

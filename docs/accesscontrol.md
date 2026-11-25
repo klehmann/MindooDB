@@ -1515,7 +1515,12 @@ await directory.listTeamMailboxes();   // [{ groupName: "support", mailboxId: "k
 - **Depositors.** The mail gateway (`depositPrefixes` with `tmail_` or `tcal_`)
   and, under `internalMail`, every other member deposit messages (`memo_…`) into
   the mailbox and invitation requests (`cinv_…`) into the calendar, sealed to a
-  deposit key of the team's key document (userkeys.md §6.8).
+  deposit key of the team's key document (userkeys.md §6.8). Depositors cannot
+  read the team databases, so a member publishes the public halves in a
+  `tbox_…` record in `userdirectory` (`tenant.publishTeamShares(mailboxId,
+  { tmail_: key, tcal_: key })`, read with `directory.getTeamShares(mailboxId)`).
+  Only records created by a current member of the group count; the highest
+  revision wins.
 - **The admin** syncs ciphertext, as for personal databases. Nobody else gets
   anything; without a group carrying the id, nobody but the admin does.
 - **Keys.** As for personal databases, access is not decryption: the team's

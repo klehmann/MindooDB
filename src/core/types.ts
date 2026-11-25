@@ -1269,6 +1269,15 @@ export interface MindooTenant {
   }): Promise<import("./personalShares").PersonalSharesRecord>;
   /** This person's current delegation record, or null. */
   getOwnPersonalShares?(): Promise<import("./personalShares").PersonalSharesRecord | null>;
+  /**
+   * Publish the deposit keys of a team mailbox (`tmail_`, `tcal_`) the current
+   * user is a member of (docs/accesscontrol.md §6.11, "Team databases"). Keys
+   * left out are kept from the current record.
+   */
+  publishTeamShares?(
+    mailboxId: string,
+    depositKeys: Record<string, import("./personalShares").PersonalShareDepositKey>,
+  ): Promise<import("./teamShares").TeamSharesRecord>;
   sealValue?(
     value: Uint8Array,
     recipients: import("./userkeys/sealedTypes").RecipientSpec[],
@@ -4371,6 +4380,12 @@ export interface MindooTenantDirectory {
    * records that person created count. Null when there is none.
    */
   getPersonalShares?(grantDocId: string): Promise<import("./personalShares").PersonalSharesRecord | null>;
+  /**
+   * The deposit-key record (`tbox_`) of a team mailbox: the public halves
+   * depositors seal deliveries to. Only records created by a current member of
+   * the team's group count. Null when there is none.
+   */
+  getTeamShares?(mailboxId: string): Promise<import("./teamShares").TeamSharesRecord | null>;
   /** The delegation records that list `delegateGrantDocId` as a delegate (what was shared with that person). */
   listPersonalSharesDelegatedTo?(delegateGrantDocId: string): Promise<import("./personalShares").PersonalSharesRecord[]>;
   setGrantPersonalDatabaseRights?(
