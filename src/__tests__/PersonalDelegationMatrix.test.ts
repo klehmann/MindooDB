@@ -37,6 +37,7 @@ import {
   type PrivateUserId,
 } from "../core/types";
 import type { ServerConfig } from "../server/types";
+import { fingerprintPublicKeyPem } from "../core/userkeys/fingerprint";
 
 const PASSWORD = "member-pass";
 const SYSTEM_ADMIN_PASSWORD = "sysadmin-pass";
@@ -202,7 +203,28 @@ describe("delegation rights over time (real server, matrix)", () => {
     };
     const grants = {} as Record<Actor, string>;
     for (const actor of Object.keys(usernames) as Actor[]) grants[actor] = await grantOf(usernames[actor]);
-    return { tenantId, tenants, usernames, grants, janeGrant };
+    /** A second device of `who`, added with a device certificate ("Add device", not on the grant). */
+    async function certifiedDevice(who: "bob" | "carol"): Promise<MindooTenant> {
+      const owner = tenants[who];
+      const ownerDirectory = (await jane.openDirectory()) as MindooTenantDirectory & {
+        setDeviceSelfGrant(username: string, key: string | null, adminKey: unknown, password: string): Promise<void>;
+      };
+      await ownerDirectory.setDeviceSelfGrant(usernames[who], await owner.getDeviceSelfGrantPublicKey!(), admin.userSigningKeyPair.privateKey, PASSWORD);
+      await push(jane, "directory", adminAuth);
+      await pull(owner, "directory");
+      const factory = new BaseMindooTenantFactory(new IsolatedInMemoryStoreFactory(), crypto);
+      const device = await factory.createUserId(usernames[who], PASSWORD);
+      await owner.issueDeviceCertificate!({ signingPublicKey: device.userSigningKeyPair.publicKey, encryptionPublicKey: device.userEncryptionKeyPair.publicKey }, "Tablet");
+      await push(owner, USER_DIRECTORY_DB_ID);
+      const delivery = (await factory.discoverTenantsOnServer(baseUrl, { user: device, password: PASSWORD })).find((d) => d.tenantId === tenantId)!;
+      const joined = (await factory.bootstrapTenantFromDelivery(delivery, { user: device, password: PASSWORD, serverUrl: baseUrl })).tenant;
+      await pull(joined, "directory");
+      await pull(joined, USER_DIRECTORY_DB_ID);
+      joined.noteUserDirectoryFetched!();
+      await joined.reconcileUserKeys!();
+      return joined;
+    }
+    return { tenantId, tenants, usernames, grants, janeGrant, certifiedDevice };
   }
 
   /** Runs a scenario: a list of steps, each followed by the oracle check. */
@@ -524,6 +546,75 @@ describe("delegation rights over time (real server, matrix)", () => {
       },
       async (w) => w.revoke("carol", "calendar"),
     ]));
+
+  test("a device the delegate certified themselves gets the same rights, and loses them with the delegation", () =>
+    scenario("certified", [
+      async (w) => {
+        await w.grant("bob", "mail", "edit");
+        await w.write("jane", "mail");
+        await w.deliver("mail");
+      },
+      async (w) => {
+        const tablet = await w.t.certifiedDevice("bob");
+        const dbId = w.dbId("mail");
+        const db = await pull(tablet, dbId);
+        const markers: string[] = [];
+        for (const id of await db.getAllDocumentIds()) {
+          const marker = (await db.getDocument(id)).getData().marker;
+          if (typeof marker === "string") markers.push(marker);
+        }
+        expect(markers.sort()).toEqual(w.expected("bob", "mail"));
+        // Writing from the tablet counts as Bob, who may edit.
+        await db.createDocument({ groupKeyDocId: w.groups.mail.getId(), initialValues: { marker: w.marker("bob", "mail") + "-tablet" } });
+        const pushed = await push(tablet, dbId);
+        expect(pushed.rejectedEntries ?? []).toEqual([]);
+        // Taken away: the tablet is refused and drops its copy as well.
+        await w.revoke("bob", "mail");
+        await pull(tablet, USER_DIRECTORY_DB_ID);
+        await expect(pull(tablet, dbId)).rejects.toThrow(/denied|ACCESS_DENIED|deposit sealed documents only/i);
+        expect(await (await openDb(tablet, dbId)).getStore().getAllIds()).toEqual([]);
+        // Jane reads what the tablet wrote while it was allowed.
+        w.written.push({ marker: (await findMarker(w, "-tablet"))!, author: "bob", kind: "mail", step: w.step, accepted: true });
+      },
+    ]));
+
+  test("a withdrawn device certificate ends the device's access while the delegation stays", () =>
+    scenario("certrevoked", [
+      async (w) => {
+        await w.grant("bob", "mail", "edit");
+        await w.deliver("mail");
+      },
+      async (w) => {
+        const tablet = await w.t.certifiedDevice("bob");
+        const dbId = w.dbId("mail");
+        await pull(tablet, dbId);
+        expect((await (await openDb(tablet, dbId)).getStore().getAllIds()).length).toBeGreaterThan(0);
+        // Bob withdraws the tablet's certificate; Bob himself keeps the delegation.
+        const bob = w.t.tenants.bob as MindooTenant & { revokeOwnDeviceCertificate(fp: string): Promise<number> };
+        const tabletKey = (await tablet.getCurrentUserId()).userSigningPublicKey;
+        const fingerprint = await fingerprintPublicKeyPem(tabletKey, crypto.getSubtle());
+        expect(await bob.revokeOwnDeviceCertificate(fingerprint)).toBe(1);
+        await push(w.t.tenants.bob, USER_DIRECTORY_DB_ID);
+        // The withdrawn device is no device of Bob's any more: the server does
+        // not even let it sign in, for any database. (What it holds locally is
+        // a lost device's problem: remote wipe, docs/accesscontrol.md §6.5.)
+        await expect(pull(tablet, USER_DIRECTORY_DB_ID)).rejects.toThrow(/not yet in the tenant directory|denied|revoked/i);
+        await expect(pull(tablet, dbId)).rejects.toThrow();
+        // A job written on the tablet now is refused as well.
+        const db = await openDb(tablet, dbId);
+        await db.createDocument({ groupKeyDocId: w.groups.mail.getId(), initialValues: { marker: "MKR-certrevoked-late" } }).catch(() => undefined);
+        await expect(push(tablet, dbId)).rejects.toThrow();
+      },
+    ]));
+
+  async function findMarker(w: World, suffix: string): Promise<string | undefined> {
+    const db = await pull(w.t.tenants.jane, w.dbId("mail"));
+    for (const id of await db.getAllDocumentIds()) {
+      const marker = (await db.getDocument(id)).getData().marker;
+      if (typeof marker === "string" && marker.endsWith(suffix)) return marker;
+    }
+    return undefined;
+  }
 
   test("two delegates, one removed: the other keeps reading", () =>
     scenario("two", [
