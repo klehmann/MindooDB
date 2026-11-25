@@ -962,6 +962,15 @@ Lookups must match against **both** the legacy unsalted hash and `hashV2` so tha
 pre-existing directory data keeps working; new documents write `hashV2`. Record the
 hash version on the document (e.g. `username_hash_v: 1 | 2`) to avoid ambiguity.
 
+**Group mail addresses.** A group can carry a mail address, which makes it a
+distribution list for the mail gateway (MindooMail): `setGroupMailAddress(groupName,
+address | null, adminKey, adminPassword)`, `getGroupMailAddress(groupName)`,
+`listGroupMailAddresses()`. The address is stored on the group document as
+`mail_encrypted`, encrypted with the tenant `default` key like the member names, so
+members read it and the sync server does not. It carries no rights; who receives
+mail for it is decided by whoever expands the group's members (Haven writes the
+expanded list into the gateway's sealed configuration).
+
 ### 6.6 Default create key (`defaultCreateKeyId`)
 
 A policy may also set a single `defaultCreateKeyId`: the `decryptionKeyId` a

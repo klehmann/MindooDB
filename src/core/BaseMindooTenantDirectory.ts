@@ -5781,6 +5781,64 @@ export class BaseMindooTenantDirectory implements MindooTenantDirectory, KeyBagR
     return Array.from(members);
   }
 
+  async getGroupMailAddress(groupName: string): Promise<string | null> {
+    const doc = await this.loadGroupDoc(groupName);
+    const encrypted = doc ? (doc.getData() as Record<string, unknown>).mail_encrypted : undefined;
+    return typeof encrypted === "string" && encrypted ? this.decryptGroupMemberForTenant(encrypted) : null;
+  }
+
+  async listGroupMailAddresses(): Promise<Array<{ groupName: string; address: string }>> {
+    const result: Array<{ groupName: string; address: string }> = [];
+    for (const groupName of await this.getGroups()) {
+      const address = await this.getGroupMailAddress(groupName);
+      if (address) result.push({ groupName, address });
+    }
+    return result.sort((a, b) => a.groupName.localeCompare(b.groupName));
+  }
+
+  async setGroupMailAddress(
+    groupName: string,
+    address: string | null,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void> {
+    const normalizedGroupName = this.normalizeGroupName(groupName);
+    const trimmed = address?.trim().toLowerCase() ?? "";
+    if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+      throw new Error(`"${address}" is not a mail address`);
+    }
+    const doc = await this.loadGroupDoc(normalizedGroupName);
+    if (!doc) throw new Error(`Group "${normalizedGroupName}" does not exist`);
+    const directoryDB = await this.getDirectoryDB();
+    const adminSigningKeyPair: SigningKeyPair = await this.adminKeyPair(administrationPrivateKey, administrationPrivateKeyPassword);
+    const encrypted = trimmed ? await this.encryptGroupMemberForTenant(trimmed) : "";
+    await directoryDB.changeDoc(
+      doc,
+      (d: MindooDoc) => {
+        const data = d.getData();
+        if (encrypted) data.mail_encrypted = encrypted;
+        else delete data.mail_encrypted;
+      },
+      { signingKeyPair: adminSigningKeyPair, signingKeyPassword: administrationPrivateKeyPassword },
+    );
+    this.groupsCache.delete(normalizedGroupName);
+    this.invalidateUnifiedCache();
+  }
+
+  /** The (merged) group's document, or null. */
+  private async loadGroupDoc(groupName: string): Promise<MindooDoc | null> {
+    const directoryDB = await this.getDirectoryDB();
+    await directoryDB.syncStoreChanges();
+    await this.updateUnifiedCache();
+    const cached = this.groupsCache.get(this.normalizeGroupName(groupName));
+    if (!cached) return null;
+    try {
+      return await directoryDB.getDocument(cached.docId);
+    } catch {
+      return null;
+    }
+  }
+
   async addUsersToGroup(
     groupName: string,
     username: string[],

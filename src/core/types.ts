@@ -4649,6 +4649,25 @@ export interface MindooTenantDirectory {
   getGroupMembers(groupName: string): Promise<string[]>;
 
   /**
+   * The mail address of a group (a distribution list delivered by the mail
+   * gateway), or null. Stored on the group document encrypted with the tenant
+   * `default` key, like the member names: members read it, the server does not.
+   */
+  getGroupMailAddress?(groupName: string): Promise<string | null>;
+  /** Every group with a mail address: `[{ groupName, address }]`. */
+  listGroupMailAddresses?(): Promise<Array<{ groupName: string; address: string }>>;
+  /**
+   * Set or remove (`null`) the mail address of a group. Admin-signed, like the
+   * group's members; the group must exist.
+   */
+  setGroupMailAddress?(
+    groupName: string,
+    address: string | null,
+    administrationPrivateKey: EncryptedPrivateKey,
+    administrationPrivateKeyPassword: string,
+  ): Promise<void>;
+
+  /**
    * Deletes a group. Does nothing if the group does not exist.
    * 
    * @param groupName The name of the group to delete (case-insensitive, converted to lowercase)
