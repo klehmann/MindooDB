@@ -19573,9 +19573,49 @@ export class BaseMindooDB implements MindooDB {
         scannedEntries: syncResult.scanned,
         cancelled: false,
       };
+    } catch (error) {
+      if (isPersonal && networkErrorType(error) === NetworkErrorType.ACCESS_DENIED) {
+        await this.dropReplicaIfAccessRevoked().catch((dropError) =>
+          this.logger.warn(`Could not drop the replica of ${dbId} after access was revoked: ${dropError}`),
+        );
+      }
+      throw error;
     } finally {
       restoreAuthOverride();
     }
+  }
+
+  /**
+   * Someone else's personal database (a delegated mailbox, calendar or
+   * contacts, docs/accesscontrol.md §6.11 "Delegation") whose owner took the
+   * delegation away: from then on the server refuses this replica's sync, so
+   * the key rotation that would hide the documents (§6.3 of userkeys.md) never
+   * arrives here. When the server refuses and this tenant's own directory
+   * agrees that the database is no longer readable, the local copy is removed
+   * for good: every document's entries, attachments and derived caches. A
+   * later delegation brings it back with the next pull.
+   *
+   * @returns how many documents were removed (0 when access was not revoked).
+   */
+  async dropReplicaIfAccessRevoked(): Promise<number> {
+    const dbId = this.store.getId();
+    if (personalDatabaseOwner(dbId) === null || this.isTimeTravelMode()) return 0;
+    const directory = await this.tenant.openDirectory();
+    if (typeof directory.canReadDatabase !== "function" || (await directory.canReadDatabase(dbId))) return 0;
+    const docIds = new Set((await this.scanAllMetadata(this.store)).map((meta) => meta.docId));
+    for (const docId of docIds) {
+      await this.purgeDocumentHistory(docId);
+    }
+    // Deposit keys of the groups this replica could read are given up with them.
+    for (const fingerprint of this.depositKeysRegistered.keys()) this.tenant.unregisterDepositUnwrapKey(fingerprint);
+    this.depositKeysRegistered.clear();
+    // Pull from the start again should the delegation come back: the cursors
+    // point past entries this replica no longer has.
+    this.syncScanCursors.clear();
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+    this.logger.info(`Access to ${dbId} was revoked: removed ${docIds.size} documents from this replica`);
+    return docIds.size;
   }
 
   /**

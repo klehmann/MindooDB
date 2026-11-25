@@ -6229,6 +6229,13 @@ export interface MindooDB {
    * only those of `groupDocId` when given.
    */
   listDepositKeys?(groupDocId?: string): Promise<import("./userkeys/depositKeys").DepositKeyInfo[]>;
+  /**
+   * For someone else's personal database: remove this replica's copy when the
+   * tenant directory says this user may no longer read it (the delegation was
+   * taken away). Runs by itself when a pull is refused. Returns the number of
+   * documents removed.
+   */
+  dropReplicaIfAccessRevoked?(): Promise<number>;
 
   /**
    * Predict whether deleting `doc` via `deleteDocument` would be allowed by the

@@ -1474,7 +1474,13 @@ const record = await directory.getPersonalShares(janeGrantDocId);
   remove from the record.
 - **Revocation.** Takes effect on the server with the next record: the delegate
   is refused on the next sync call. What they already synced they keep, as
-  everywhere (§13).
+  everywhere (§13). Because they are refused, their device never receives the
+  group key rotation that would hide the owner's documents. MindooDB therefore
+  removes the replica itself when a pull of someone else's personal database
+  is refused and its own `userdirectory` shows that the record no longer lists
+  the user (`canReadDatabase` is false): every document's entries, attachments
+  and caches (`db.dropReplicaIfAccessRevoked()`, also callable directly). A
+  device that stays offline shows the old copy until its next sync attempt.
 - **Policy.** The tenant default policy's `mailDelegation`: `"members"`
   (default), `"rules"` (only to members matched by a `doc_read` allow rule
   for the database) or `"off"` (records ignored). Open core, like the rest of
