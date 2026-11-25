@@ -391,13 +391,10 @@ describe("delegation rights over time (real server, matrix)", () => {
         db = await pull(this.t.tenants[actor], this.dbId(kind));
       } catch {
         // Refused by the server. A removed delegate never receives the rotation
-        // that would hide the group's documents, so the honest client (Haven)
-        // drops the replica once its own directory says it may no longer read
-        // the database; while it still may (refused for another reason), what
-        // it holds is checked.
-        const directory = (await this.t.tenants[actor].openDirectory()) as MindooTenantDirectory;
-        if (!(await directory.canReadDatabase!(this.dbId(kind)))) return [];
-        db = await this.db(actor, kind);
+        // that would hide the group's documents; MindooDB removes the replica
+        // itself (dropReplicaIfAccessRevoked). What is left here is checked.
+        db = await this.db(actor, kind).catch(() => null as never);
+        if (!db) return [];
         await db.syncStoreChanges();
       }
       const markers: string[] = [];
@@ -481,6 +478,11 @@ describe("delegation rights over time (real server, matrix)", () => {
         await w.deliver("mail", { staleKey: old });
         await w.deliver("mail");
         await w.write("jane", "mail");
+      },
+      async (w) => {
+        // Bob's device tried to sync (check above) and removed its copy: no entries left at all.
+        const bobDb = await w.db("bob", "mail");
+        expect(await bobDb.getStore().getAllIds()).toEqual([]);
       },
     ]));
 

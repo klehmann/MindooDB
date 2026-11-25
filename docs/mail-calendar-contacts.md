@@ -88,7 +88,7 @@ Every change is signed by the device that made it, and devices belong to people 
 
 **Delegating a mailbox.** The owner picks a colleague and the right in the account settings. Haven adds the colleague to the account's groups, records the right in the published record, and, without history, creates a new deposit key. On the colleague's next sync the mailbox appears under "shared with me".
 
-**Taking it away.** Haven removes the colleague from the groups (new keys), creates new deposit keys and updates the record. From then on the server refuses the colleague's sync. Because the colleague's device can no longer receive the key change, it deletes its copy of that mailbox by itself as soon as its own copy of the directory shows that the delegation has ended.
+**Taking it away.** Haven removes the colleague from the groups (new keys), creates new deposit keys and updates the record. From then on the server refuses the colleague's sync. Because the colleague's device can no longer receive the key change, MindooDB on that device deletes its copy of that mailbox by itself at the next sync attempt, as soon as the server refuses and its own copy of the directory shows that the delegation has ended. A device that stays offline keeps showing the old copy until then.
 
 **Sending on someone's behalf.** The delegate writes the outgoing message into the owner's outbox, sealed for the owner, the delegate and the gateway. The server accepts only new outgoing messages from them there. The gateway checks the right at sending time and sends the message with both names.
 
