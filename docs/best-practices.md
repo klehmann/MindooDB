@@ -635,39 +635,6 @@ operation with a paper trail, never as routine cleanup: it is the one place wher
 append-only integrity is intentionally broken for a document, and it is
 irreversible. See [Compliance Patterns](usecases/compliance-patterns.md).
 
-### 6.6 Keep large values cheap to load
-
-Loading a document replays its Automerge history in WebAssembly, and the memory
-that takes depends on how values were written far more than on their stored
-size. Measured with Automerge 3.5 (benchmark in `bench/automerge-memory/`):
-
-| Content | Wasm memory per stored MB while loading |
-|---|---|
-| Collaborative text (plain string), one large field | 100–420 MB |
-| Collaborative text, many small values | 40–160 MB |
-| Atomic strings, numbers, lists of records | 6–30 MB |
-
-A plain string is collaborative text: Automerge keeps one operation per
-character, each with its own id and predecessor, so 1 MB of text is a million
-operations in memory even though it compresses well on disk. An atomic string is
-one operation. A wasm instance has 4 GB; one document that exceeds it ends that
-call with `RuntimeError: unreachable`, and every later call on the instance, for
-every document in the process, throws `Module terminated` until the process (or
-browser page) restarts. Wasm memory also never shrinks: a single 2 GB load keeps
-2 GB until then.
-
-- **Write large strings that nobody edits character by character as atomic.**
-  Generated content, serialized state, imported files, base64 payloads: use
-  `MindooValue.atomic()` or store them as attachments.
-- **Never assign a large text again.** `data.body = newBody` does not edit the
-  old text; it creates a new text object with one operation per character and
-  keeps the old one in the history. Twenty full rewrites of a 1 MB field load
-  with about 2.5 GB as a snapshot. Use `d.updateText()` so only the changed
-  characters are stored.
-- **Keep documents with many changes snapshotted.** Many small changes cost
-  time rather than memory when replayed one entry at a time; snapshots keep
-  that replay short ([§6.3](#63-plan-for-growth-before-you-need-to)).
-
 ---
 
 ## 7. Local-First, Offline, and Collaboration
@@ -1193,9 +1160,6 @@ Protocol](network-sync-protocol.md).
 - [ ] Fields that are only valid together are written as one atomic value, as
       an object replaced as a whole, or as an append-only history list
       ([§7.7](#77-keep-fields-that-belong-together-consistent)).
-- [ ] Large strings nobody edits character by character are atomic or
-      attachments, and large texts change through `updateText()`, never by
-      reassignment ([§6.6](#66-keep-large-values-cheap-to-load)).
 - [ ] Query filters on timestamp fields compare against ISO 8601 UTC strings.
 - [ ] Positions in collaborative text (comments, highlights) are stored as text
       cursors, not indexes, with ranges anchored on their last character.
