@@ -57,13 +57,37 @@ export function splitGenerations(bytes: Uint8Array): Uint8Array[] {
   return gens;
 }
 
+/** `extra` keys as 4-byte big-endian epoch + 32-byte key each. */
+export function concatExtraKeys(extra: Array<{ epoch: number; key: Uint8Array }>): Uint8Array {
+  const out = new Uint8Array(extra.length * 36);
+  extra.forEach((entry, i) => {
+    new DataView(out.buffer).setUint32(i * 36, entry.epoch);
+    out.set(entry.key, i * 36 + 4);
+  });
+  return out;
+}
+
+export function splitExtraKeys(bytes: Uint8Array): Array<{ epoch: number; key: Uint8Array }> {
+  const out: Array<{ epoch: number; key: Uint8Array }> = [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let i = 0; i + 36 <= bytes.length; i += 36) {
+    out.push({ epoch: view.getUint32(i), key: bytes.slice(i + 4, i + 36) });
+  }
+  return out;
+}
+
 export async function sealBundle(input: {
   crypto: CryptoAdapter;
   generations: Uint8Array[];
   wrapsTo: Array<{ kind: "user" | "device"; fingerprint: string; publicKeyPem: string }>;
+  /** Keys of concurrent rotations, see {@link EntryRecipients.extra}. */
+  extra?: Array<{ epoch: number; key: Uint8Array }>;
 }): Promise<EntryRecipients> {
   const bundleKey = input.crypto.getRandomValues(new Uint8Array(32));
   const bundle = await encryptAesGcm(input.crypto, bundleKey, concatGenerations(input.generations));
+  const extra = input.extra?.length
+    ? bytesToBase64(await encryptAesGcm(input.crypto, bundleKey, concatExtraKeys(input.extra)))
+    : undefined;
   const rsa = new RSAEncryption(input.crypto);
   const wraps = [];
   for (const target of input.wrapsTo) {
@@ -78,6 +102,7 @@ export async function sealBundle(input: {
     epoch: input.generations.length,
     bundle: bytesToBase64(bundle),
     wraps,
+    ...(extra ? { extra } : {}),
   };
 }
 
@@ -91,18 +116,39 @@ export async function openBundle(input: {
   recipients: EntryRecipients;
   privateKey: CryptoKey;
 }): Promise<Uint8Array[]> {
+  return (await openBundleWithExtra(input)).generations;
+}
+
+/**
+ * {@link openBundle} plus the keys of concurrent rotations the block carries
+ * (`extra`, whole-history readers only).
+ */
+export async function openBundleWithExtra(input: {
+  crypto: CryptoAdapter;
+  recipients: EntryRecipients;
+  privateKey: CryptoKey;
+}): Promise<{ generations: Uint8Array[]; extra: Array<{ epoch: number; key: Uint8Array }> }> {
   const rsa = new RSAEncryption(input.crypto);
   let lastError: unknown;
   const tiers = [
     { bundle: input.recipients.bundle, wraps: input.recipients.wraps ?? [] },
     ...(input.recipients.partial ?? []),
   ];
-  for (const tier of tiers) {
+  for (const [index, tier] of tiers.entries()) {
     for (const wrap of tier.wraps) {
       try {
         const bundleKey = await rsa.decrypt(base64ToBytes(wrap.wrapped), input.privateKey);
         const packed = await decryptAesGcm(input.crypto, bundleKey, base64ToBytes(tier.bundle));
-        return splitGenerations(packed);
+        const generations = splitGenerations(packed);
+        let extra: Array<{ epoch: number; key: Uint8Array }> = [];
+        if (index === 0 && input.recipients.extra) {
+          try {
+            extra = splitExtraKeys(await decryptAesGcm(input.crypto, bundleKey, base64ToBytes(input.recipients.extra)));
+          } catch {
+            // a damaged extra field does not cost the generations
+          }
+        }
+        return { generations, extra };
       } catch (error) {
         lastError = error;
       }
@@ -120,10 +166,19 @@ export async function openBundleRange(input: {
   recipients: EntryRecipients;
   privateKey: CryptoKey;
 }): Promise<Array<{ epoch: number; key: Uint8Array }>> {
-  const generations = await openBundle(input);
+  return (await openBundleRangeWithExtra(input)).range;
+}
+
+/** {@link openBundleRange} plus the block's keys of concurrent rotations. */
+export async function openBundleRangeWithExtra(input: {
+  crypto: CryptoAdapter;
+  recipients: EntryRecipients;
+  privateKey: CryptoKey;
+}): Promise<{ range: Array<{ epoch: number; key: Uint8Array }>; extra: Array<{ epoch: number; key: Uint8Array }> }> {
+  const { generations, extra } = await openBundleWithExtra(input);
   const top =
     typeof input.recipients.epoch === "number" && input.recipients.epoch >= generations.length
       ? input.recipients.epoch
       : generations.length;
-  return generations.map((key, index) => ({ epoch: top - index, key }));
+  return { range: generations.map((key, index) => ({ epoch: top - index, key })), extra };
 }

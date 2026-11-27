@@ -251,12 +251,14 @@ import {
   DEFAULT_RECIPIENT_HISTORY,
   groupKeyDocIdOf,
   allRecipientWraps,
+  hasRecipientWraps,
   isSealedKeyId,
   sealedKeyDocId,
   sealedKeyId,
   type EntryRecipients,
   type RecipientChangeOptions,
   type RecipientChangeResult,
+  type RecipientRepairNeed,
   type RecipientSpec,
 } from "./userkeys/sealedTypes";
 import {
@@ -16453,6 +16455,61 @@ export class BaseMindooDB implements MindooDB {
     return this.mutateRecipients(doc, "reveal", recipients, options);
   }
 
+  async recipientsNeedRepair(doc: MindooDoc): Promise<RecipientRepairNeed | null> {
+    const keyId = doc.getDecryptionKeyId();
+    if (!isSealedKeyId(keyId) || groupKeyDocIdOf(keyId, doc.getId()) !== undefined) return null;
+    const tenant = this.tenant as BaseMindooTenant;
+    if (tenant.getSealedGenerations(keyId).length === 0) return null;
+    const internalDoc = this.getCachedDocument(doc.getId()) ?? (await this.loadDocumentInternal(doc.getId()));
+    if (!internalDoc || internalDoc.isDeleted) return null;
+    const blocks = (await this.scanAllMetadata(this.store, { docId: doc.getId() }))
+      .map((entry) => entry.recipients)
+      .filter((block): block is EntryRecipients => !!block && hasRecipientWraps(block));
+    const newest = newestRecipientBlock(await this.scanAllMetadata(this.store, { docId: doc.getId() }));
+    if (!newest) return null;
+    const topBundles = new Set(blocks.filter((block) => block.epoch === newest.epoch).map((block) => block.bundle));
+    const wrapped = new Set(allRecipientWraps(newest).map((wrap) => wrap.keyFingerprint));
+    const map = readEncryptFor(internalDoc.doc as unknown as MindooDocPayload);
+    const missing: string[] = [];
+    const stale: string[] = [];
+    const activeSpecs: RecipientSpec[] = [];
+    const activeLabels: string[] = [];
+    for (const [id, entry] of Object.entries(map)) {
+      const label = entry.label ?? id;
+      if (entry.removedAt) {
+        if (entry.keyFingerprint && wrapped.has(entry.keyFingerprint)) stale.push(label);
+        continue;
+      }
+      if (entry.keyFingerprint && wrapped.has(entry.keyFingerprint)) continue;
+      activeSpecs.push(entry.kind === "device" ? { device: entry.keyFingerprint ?? id, label: entry.label } : label);
+      activeLabels.push(label);
+    }
+    if (activeSpecs.length) {
+      // The stored fingerprint may be an older User-Key generation: count the
+      // reader as wrapped when the newest block wraps their current key.
+      const resolved = await resolveRecipientSpecs({
+        tenant,
+        specs: activeSpecs,
+        options: { includeSelf: false, strict: false },
+        addedBy: "",
+        now: semanticNow(),
+      });
+      const current = new Set(resolved.targets.filter((target) => wrapped.has(target.keyFingerprint)).map((target) => target.id));
+      for (const [index, label] of activeLabels.entries()) {
+        const target = resolved.targets.find(
+          (candidate) => candidate.id === label || candidate.label === label || candidate.stableId === label,
+        );
+        if (!target || !current.has(target.id)) missing.push(activeLabels[index]);
+      }
+    }
+    const need = { forked: topBundles.size > 1, missing, stale };
+    return need.forked || missing.length || stale.length ? need : null;
+  }
+
+  async repairRecipients(doc: MindooDoc, options?: RecipientChangeOptions): Promise<RecipientChangeResult> {
+    return this.mutateRecipients(doc, "repair", [], options);
+  }
+
   async canChangeRecipients(
     doc: MindooDoc,
     next: RecipientSpec[],
@@ -16466,7 +16523,7 @@ export class BaseMindooDB implements MindooDB {
 
   private async mutateRecipients(
     doc: MindooDoc,
-    mode: "add" | "remove" | "set" | "reveal",
+    mode: "add" | "remove" | "set" | "reveal" | "repair",
     specs: RecipientSpec[],
     options?: RecipientChangeOptions,
   ): Promise<RecipientChangeResult> {
@@ -16494,16 +16551,20 @@ export class BaseMindooDB implements MindooDB {
     const signer =
       options?.signingKeyPair?.publicKey ??
       (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-    const resolved = await resolveRecipientSpecs({
-      tenant,
-      specs,
-      options: {
-        includeSelf: mode === "set" ? options?.includeSelf !== false : false,
-        strict: options?.strict,
-      },
-      addedBy: signer,
-      now,
-    });
+    // A repair names nobody: it re-seals for the readers already on the list.
+    const resolved =
+      mode === "repair"
+        ? { targets: [] as ResolvedWrapTarget[], skipped: [] as Awaited<ReturnType<typeof resolveRecipientSpecs>>["skipped"] }
+        : await resolveRecipientSpecs({
+            tenant,
+            specs,
+            options: {
+              includeSelf: mode === "set" ? options?.includeSelf !== false : false,
+              strict: options?.strict,
+            },
+            addedBy: signer,
+            now,
+          });
     const currentMap = readEncryptFor(
       internalDoc.doc as unknown as MindooDocPayload,
     );
@@ -16569,7 +16630,9 @@ export class BaseMindooDB implements MindooDB {
       (mode === "add" || mode === "set") &&
       addedTargets.length > 0 &&
       (options?.history ?? DEFAULT_RECIPIENT_HISTORY) === "none";
-    const rotate = removedStableIds.length > 0 || withoutHistory;
+    // A repair (after concurrent recipient changes) always seals a new
+    // generation for exactly the current readers.
+    const rotate = removedStableIds.length > 0 || withoutHistory || mode === "repair";
     const heldSeries = tenant.getSealedSeries
       ? tenant.getSealedSeries(internalDoc.decryptionKeyId)
       : tenant
@@ -16683,6 +16746,8 @@ export class BaseMindooDB implements MindooDB {
       generations,
       targets: remaining,
       epoch,
+      // Keys of concurrent branches travel along, for readers added later.
+      extra: tenant.getSealedForkKeys(internalDoc.decryptionKeyId),
     });
     tenant.rememberSealedGenerations(
       internalDoc.decryptionKeyId,

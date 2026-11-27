@@ -10,6 +10,7 @@ export {
   type ResolvedRecipient,
   type EntryRecipients,
   type RecipientChangeResult,
+  type RecipientRepairNeed,
 } from "./sealedTypes";
 export {
   resolveRecipientSpecs,
