@@ -49,9 +49,9 @@ To find documents instead of reading one you already know, use [`db.query()` and
 
 | `getFieldType()` | How you write it | Merges on concurrent writes | Reads back as |
 |---|---|---|---|
-| `"text"` | a plain string | edits through `updateText()` / `textSplice` merge character by character; a plain assignment replaces the whole value | `string` |
+| `"text"` | a plain string under 64 KB, or `MindooValue.text(...)` at any size | edits merge character by character; assigning a string of 1 KB or more to a text field stores only the change | `string` |
 | `"richText"` | `applyRichTextPatch()` / `applyRichTextStepsPatch()` | marks and blocks merge | `string` (use `getRichTextSnapshot()` for spans) |
-| `"atomic"` | `MindooValue.atomic("open")` | one write wins as a whole | `string` |
+| `"atomic"` | `MindooValue.atomic("open")`, or a plain string of 64 KB or more | one write wins as a whole | `string` |
 | `"counter"` | `MindooValue.counter(0)`, then `incrementCounter()` | increments are summed | `number` |
 | `"timestamp"` | `MindooValue.timestamp(new Date())` | one write wins | `Date` |
 | `"number"`, `"boolean"`, `"null"` | plain value | one write wins | as written |
@@ -60,6 +60,8 @@ To find documents instead of reading one you already know, use [`db.query()` and
 | `"map"` | object | different keys merge, same key: one write wins | object |
 
 Pick the type when you create the field. Ids, status and enum values, URLs and hashes should be `atomic`, so two concurrent writes never produce a mix. Tallies several people change should be counters.
+
+Strings of 64 KB or more (`LARGE_STRING_ATOMIC_THRESHOLD`) are stored atomic unless you write them as `MindooValue.text(...)`: collaborative text keeps one Automerge operation per character, which costs 100–500 bytes of memory per character on every load ([Best Practices §6.6](./best-practices.md)). A string assigned to a field that already holds text is stored as a splice of the changed part once the old or new text has 1 KB or more (`TEXT_ASSIGN_SPLICE_THRESHOLD`); shorter strings still replace the value as a whole, so two concurrent short assignments end with one of them, not a mix.
 
 ## Write inside `changeDoc()`
 
@@ -219,7 +221,7 @@ The last case is why you edit lists instead of reassigning them. When one value 
 ## Pitfalls
 
 - **Reassigning instead of editing.** `data.tags = [...data.tags, x]` replaces the list; use `data.tags.push(x)`.
-- **Assigning text that others edit.** `data.body = newBody` replaces the text; use `d.updateText("body", newBody)`.
+- **Large text that people edit together.** A new string of 64 KB or more is stored atomic; create such a field with `MindooValue.text(...)`. Once a field is text, `d.updateText("body", newBody)` stores only the change, and so does `data.body = newBody` for texts of 1 KB or more.
 - **Plain strings for status values.** Concurrent text edits can mix two values; write `MindooValue.atomic(...)`.
 - **Arithmetic on counters.** Use `incrementCounter()`, not `+ 1`.
 - **Lists have no holes.** `data.tags[10] = x` past the end, named properties on lists and `delete data.tags[0]` throw; use `push` and `splice`.
