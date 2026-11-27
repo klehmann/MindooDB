@@ -635,6 +635,39 @@ operation with a paper trail, never as routine cleanup: it is the one place wher
 append-only integrity is intentionally broken for a document, and it is
 irreversible. See [Compliance Patterns](usecases/compliance-patterns.md).
 
+### 6.6 Keep large values cheap to load
+
+Loading a document replays its Automerge history in WebAssembly, and the memory
+that takes depends on how values were written far more than on their stored
+size. Measured with Automerge 3.5 (benchmark in `bench/automerge-memory/`):
+
+| Content | Wasm memory per stored MB while loading |
+|---|---|
+| Collaborative text (plain string), one large field | 100–420 MB |
+| Collaborative text, many small values | 40–160 MB |
+| Atomic strings, numbers, lists of records | 6–30 MB |
+
+A plain string is collaborative text: Automerge keeps one operation per
+character, each with its own id and predecessor, so 1 MB of text is a million
+operations in memory even though it compresses well on disk. An atomic string is
+one operation. A wasm instance has 4 GB; one document that exceeds it ends that
+call with `RuntimeError: unreachable`, and every later call on the instance, for
+every document in the process, throws `Module terminated` until the process (or
+browser page) restarts. Wasm memory also never shrinks: a single 2 GB load keeps
+2 GB until then.
+
+- **Write large strings that nobody edits character by character as atomic.**
+  Generated content, serialized state, imported files, base64 payloads: use
+  `MindooValue.atomic()` or store them as attachments.
+- **Never assign a large text again.** `data.body = newBody` does not edit the
+  old text; it creates a new text object with one operation per character and
+  keeps the old one in the history. Twenty full rewrites of a 1 MB field load
+  with about 2.5 GB as a snapshot. Use `d.updateText()` so only the changed
+  characters are stored.
+- **Keep documents with many changes snapshotted.** Many small changes cost
+  time rather than memory when replayed one entry at a time; snapshots keep
+  that replay short ([§6.3](#63-plan-for-growth-before-you-need-to)).
+
 ---
 
 ## 7. Local-First, Offline, and Collaboration
@@ -833,6 +866,53 @@ end. A cursor whose character was deleted resolves to where it stood (`move:
 collaborative text (plain strings and rich text). App SDK apps use
 `db.documents.getTextCursors()` / `resolveTextCursors()` with the `read`
 capability.
+
+### 7.7 Keep fields that belong together consistent
+
+Automerge decides concurrent writes **per field**, not per change or per user.
+When two devices each change several fields offline, every field picks its own
+winner by operation id. The result is the same on every device, but it can mix
+both sides: Karsten writes `status: "PENDING", folder: "INBOX"`, Jane writes
+`status: "SENT", folder: "OUTBOX"`, and the document ends up with Jane's status
+and Karsten's folder. Which side wins a field depends on the order of the writes
+and on how much each device wrote before, not on time or on any business rule.
+
+Fields that are only valid together (status and folder, amount and currency,
+start and end, a reference and its version) need one of these patterns:
+
+| Pattern | How | Concurrent result | Trade-off |
+|---|---|---|---|
+| One atomic value | `MindooValue.atomic("PENDING;INBOX")` or `MindooValue.atomic(JSON.stringify({ status, folder }))` | one side's value as a whole | the parts are not summary-covered fields of their own; parse on read |
+| Replace a nested object as a whole | `data.state = { status: MindooValue.atomic("PENDING"), folder: MindooValue.atomic("INBOX") }` | one side's object as a whole | a concurrent edit of a single field inside the old object is lost without a conflict; never mix whole replacement with field edits on the same object |
+| Append-only history list | insert an entry at the front, trim the end: `data.states.unshift({ ... })`, then `data.states.splice(max)` | both entries survive, in a deterministic order | the list is briefly longer than `max` after a conflict; never edit an entry after inserting it |
+
+The history list keeps the losing write visible instead of hiding it in
+conflict metadata, which makes it the right choice when users should see that a
+concurrent change happened. "First entry wins" is as arbitrary as any other
+deterministic order, though: Automerge orders concurrent inserts at the same
+position by operation id. If a business rule decides (latest timestamp, `SENT`
+beats `PENDING`), put a `modifiedAt` and `modifiedBy` in each entry and apply
+the rule to the newest entries on read.
+
+```typescript
+const MAX_STATES = 5;
+
+await db.changeDoc(doc, (d) => {
+  const data = d.getData();
+  data.states.unshift({
+    status: MindooValue.atomic("PENDING"),
+    folder: MindooValue.atomic("INBOX"),
+    modifiedBy: MindooValue.atomic(currentUser),
+    modifiedAt: MindooValue.timestamp(new Date()),
+  });
+  if (data.states.length > MAX_STATES) data.states.splice(MAX_STATES);
+});
+```
+
+Whatever the pattern, the alternatives of a conflicting field remain in the
+history. `getDocumentConflictReport()` lists them with author and time, so an
+app or an admin tool can show what was overwritten ([DAG Conflict
+Analysis](dag-conflict-analysis.md)).
 
 ## 8. Building Apps for Haven
 
@@ -1110,6 +1190,12 @@ Protocol](network-sync-protocol.md).
       tallies as counters changed only by `counterIncrement`, dates as
       `MindooValue.timestamp()` — and rewritten with the same helper
       ([§7.6](#76-pick-the-value-type-that-merges-the-way-you-mean)).
+- [ ] Fields that are only valid together are written as one atomic value, as
+      an object replaced as a whole, or as an append-only history list
+      ([§7.7](#77-keep-fields-that-belong-together-consistent)).
+- [ ] Large strings nobody edits character by character are atomic or
+      attachments, and large texts change through `updateText()`, never by
+      reassignment ([§6.6](#66-keep-large-values-cheap-to-load)).
 - [ ] Query filters on timestamp fields compare against ISO 8601 UTC strings.
 - [ ] Positions in collaborative text (comments, highlights) are stored as text
       cursors, not indexes, with ranges anchored on their last character.
