@@ -1,0 +1,5 @@
+{"id":"text-edits__edits10000__text","path":"batch","changes":10001,"storedMB":1.2,"snapshotMB":0.1,"loadMs":204,"toJsMs":4,"wasmMB":62.2,"wasmTotalMB":63.4,"peakRssMB":81.4,"peakHeapMB":2.4,"keys":1}
+{"id":"field-updates__edits10000__atomic","path":"batch","changes":10001,"storedMB":1.2,"snapshotMB":0.1,"loadMs":125,"toJsMs":0,"wasmMB":21.9,"wasmTotalMB":23.1,"peakRssMB":52.9,"peakHeapMB":2.5,"keys":2}
+{"id":"small-strings-many-changes__count100000__text","path":"batch","changes":1001,"storedMB":6.5,"snapshotMB":2.6,"loadMs":3310,"toJsMs":363,"wasmMB":1107,"wasmTotalMB":1108.2,"peakRssMB":1154.8,"peakHeapMB":103.2,"keys":1}
+{"id":"large-strings__fields1_size1000000__text","path":"batch","changes":1,"storedMB":1.2,"snapshotMB":0.8,"loadMs":1190,"toJsMs":37,"wasmMB":503.2,"wasmTotalMB":504.4,"peakRssMB":477,"peakHeapMB":3.5,"keys":1}
+{"id":"small-strings__count100000__text","path":"batch","changes":1,"storedMB":6.4,"snapshotMB":2.6,"loadMs":3303,"toJsMs":339,"wasmMB":1002.1,"wasmTotalMB":1003.3,"peakRssMB":1038.8,"peakHeapMB":97.6,"keys":1}
