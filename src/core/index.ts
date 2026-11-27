@@ -12,6 +12,9 @@ export {
   isPersonalUserdirectoryDocId,
   PERSONAL_DOC_ID_PREFIXES,
   BUILTIN_PERSONAL_DATABASE_PREFIXES,
+  BUILTIN_TEAM_DATABASE_PREFIXES,
+  TEAM_MAILBOX_ID_REGEX,
+  isTeamDatabasePrefix,
   BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES,
   PURGE_REQUEST_ID_PREFIX,
   PURGE_REQUEST_FORM,
@@ -692,3 +695,6 @@ export {
   type PersonalShareDepositKey,
   type PersonalSharesRecord,
 } from "./personalShares";
+
+// Deposit keys of team mailboxes (docs/accesscontrol.md §6.11, "Team databases")
+export { TEAM_SHARES_DOC_ID_PREFIX, TEAM_SHARES_FORM, type TeamSharesRecord } from "./teamShares";

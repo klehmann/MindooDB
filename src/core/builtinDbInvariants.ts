@@ -57,7 +57,7 @@ export type BuiltinWriteOp = "doc_create" | "doc_change" | "doc_delete" | "doc_u
  * and audit refused writes while the hoster still sees ciphertext. Ownership is
  * the creator either way.
  */
-export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_", "rpp_", "sgk_", "pbox_"] as const;
+export const PERSONAL_DOC_ID_PREFIXES = ["wks_", "dev_", "qtn_", "dcert_", "rcv_", "rpp_", "sgk_", "pbox_", "tbox_"] as const;
 
 /** Is this a personal-data document id inside `userdirectory`? */
 export function isPersonalUserdirectoryDocId(docId: string | undefined | null): boolean {
@@ -137,6 +137,23 @@ export interface BuiltinWriteDecision {
 export const BUILTIN_PERSONAL_DATABASE_PREFIXES = ["mmail_", "mmailout_", "mbusy_", "mcal_", "mcon_"] as const;
 
 /**
+ * Team databases (§6.11): `tmail_<mailboxId>` (team mailbox) and
+ * `tcal_<mailboxId>` (team calendar) belong to the directory group whose
+ * `team_mailbox_id` is that id, not to a person. They follow the personal
+ * database rules (purge requests, revoked replicas) with the group's members
+ * in place of the owner's devices. `personalDatabaseOwner` returns the mailbox
+ * id as `grantDocId` for them.
+ */
+export const BUILTIN_TEAM_DATABASE_PREFIXES = ["tmail_", "tcal_"] as const;
+
+/** A team mailbox id: 8 to 40 lowercase ASCII letters and digits. */
+export const TEAM_MAILBOX_ID_REGEX = /^[a-z0-9]{8,40}$/;
+
+export function isTeamDatabasePrefix(prefix: string): boolean {
+  return (BUILTIN_TEAM_DATABASE_PREFIXES as readonly string[]).includes(prefix);
+}
+
+/**
  * Default document-id prefixes a depositor may use in a built-in personal
  * database (docs/accesscontrol.md §6.11): deposits into a mailbox are MindooMail
  * messages (`memo_…`), so documents of other kinds (events, status, folders)
@@ -146,13 +163,15 @@ export const BUILTIN_PERSONAL_DATABASE_PREFIXES = ["mmail_", "mmailout_", "mbusy
 export const BUILTIN_PERSONAL_DEPOSIT_DOC_ID_PREFIXES: Readonly<Record<string, readonly string[]>> = {
   mmail_: ["memo_"],
   mcal_: ["cinv_"],
+  tmail_: ["memo_"],
+  tcal_: ["cinv_"],
 };
 
 /**
  * Personal databases members deposit into under the tenant's `internalMail`
  * setting: messages into a mailbox, invitation requests into a calendar.
  */
-export const INTERNAL_MAIL_DEPOSIT_PREFIXES: readonly string[] = ["mmail_", "mcal_"];
+export const INTERNAL_MAIL_DEPOSIT_PREFIXES: readonly string[] = ["mmail_", "mcal_", "tmail_", "tcal_"];
 
 /** A valid personal-database prefix: lowercase letters and digits, ending in `_`. */
 export const PERSONAL_DATABASE_PREFIX_REGEX = /^[a-z][a-z0-9]*_$/;
@@ -165,7 +184,7 @@ export function personalDatabaseOwner(
   dbId: string,
   extraPrefixes: readonly string[] = [],
 ): { prefix: string; grantDocId: string } | null {
-  for (const prefix of [...BUILTIN_PERSONAL_DATABASE_PREFIXES, ...extraPrefixes]) {
+  for (const prefix of [...BUILTIN_PERSONAL_DATABASE_PREFIXES, ...BUILTIN_TEAM_DATABASE_PREFIXES, ...extraPrefixes]) {
     if (dbId.startsWith(prefix) && dbId.length > prefix.length) {
       return { prefix, grantDocId: dbId.slice(prefix.length) };
     }

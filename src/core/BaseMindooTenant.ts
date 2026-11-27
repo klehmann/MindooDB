@@ -97,6 +97,7 @@ import { DirectoryAdminKeyResolver } from "./accesscontrol/directoryAdminResolve
 import { signingKeysEqual } from "./accesscontrol/DirectoryStateNode";
 import { extractActiveKeyPairs } from "./accesscontrol/grantKeys";
 import * as shares from "./personalShares";
+import * as teamShares from "./teamShares";
 import { namedExport } from "./utils/dynamicImportInterop";
 
 /**
@@ -809,6 +810,53 @@ export class BaseMindooTenant implements MindooTenant {
     for (const old of own) {
       try {
         await db.deleteDocument(old.docId);
+      } catch {
+        // already gone
+      }
+    }
+    return record;
+  }
+
+  async publishTeamShares(
+    mailboxId: string,
+    depositKeys: Record<string, shares.PersonalShareDepositKey>,
+  ): Promise<teamShares.TeamSharesRecord> {
+    const directory = await this.openDirectory();
+    const current = await directory.getTeamShares?.(mailboxId);
+    const record: teamShares.TeamSharesRecord = {
+      form: teamShares.TEAM_SHARES_FORM,
+      mailboxId,
+      revision: (current?.revision ?? 0) + 1,
+      depositKeys: { ...(current?.depositKeys ?? {}), ...depositKeys },
+      writtenAt: Date.now(),
+    };
+    for (const [prefix, key] of Object.entries(record.depositKeys)) {
+      if (prefix !== "tmail_" && prefix !== "tcal_") throw new Error(`team shares: "${prefix}" is not a team database prefix`);
+      if (!key?.publicKey || !key?.fingerprint) throw new Error(`team shares: deposit key for "${prefix}" is incomplete`);
+    }
+    const db = await this.openDB(USER_DIRECTORY_DB_ID);
+    await db.syncStoreChanges();
+    // Own older records of this team go; other members' records stay theirs.
+    const me = await this.getCurrentUserId();
+    const old: string[] = [];
+    for (const id of await db.getAllDocumentIds({ idPrefix: teamShares.TEAM_SHARES_DOC_ID_PREFIX.slice(0, -1) })) {
+      try {
+        const doc = await db.getDocument(id);
+        const parsed = teamShares.parseTeamShares(doc.getData() as Record<string, unknown>);
+        const create = (await db.getStore().findNewEntriesForDoc([], id)).find((m) => m.entryType === "doc_create");
+        if (parsed?.mailboxId === mailboxId && create?.createdByPublicKey === me.userSigningPublicKey) old.push(id);
+      } catch {
+        // not readable
+      }
+    }
+    await db.createDocument({
+      idPrefix: teamShares.TEAM_SHARES_DOC_ID_PREFIX.slice(0, -1),
+      decryptionKeyId: PUBLIC_INFOS_KEY_ID,
+      initialValues: JSON.parse(JSON.stringify(record)) as Record<string, unknown>,
+    });
+    for (const id of old) {
+      try {
+        await db.deleteDocument(id);
       } catch {
         // already gone
       }
