@@ -530,9 +530,11 @@ await db.changeDoc(doc, (d) => {
 Edits inside `changeDoc` are recorded at the depth they happen: list methods
 (`push`, `splice`, ...) become list inserts/deletes, so concurrent inserts
 interleave instead of one overwriting the other. `d.updateText(path, value)`
-stores only the changed part of a text, so it merges with concurrent typing.
-A plain assignment replaces the whole value (`data.reviewers = [...]`,
-`data.notes = "..."`) and does not merge. [Reading and Writing
+stores only the changed part of a text, so it merges with concurrent typing;
+a string of 1 KB or more assigned to a field that already holds text is
+stored the same way.
+Any other plain assignment replaces the whole value (`data.reviewers = [...]`,
+`data.meta = {...}`) and does not merge. [Reading and Writing
 Documents](./reading-and-writing.md) has examples for every field type. For edits that already arrive as operations
 (an editor's keystrokes, a sync protocol), use the granular text and JSON patch
 APIs directly. Apps built on the App SDK get
@@ -634,6 +636,47 @@ the audit record of what was erased and by whom. Treat purge as a compliance
 operation with a paper trail, never as routine cleanup: it is the one place where
 append-only integrity is intentionally broken for a document, and it is
 irreversible. See [Compliance Patterns](usecases/compliance-patterns.md).
+
+### 6.6 Keep large values cheap to load
+
+Loading a document replays its Automerge history in WebAssembly, and the memory
+that takes depends on how values were written far more than on their stored
+size. Measured with Automerge 3.5 (benchmark in `bench/automerge-memory/`):
+
+| Content | Wasm memory per stored MB while loading |
+|---|---|
+| Collaborative text, one large field | 100–420 MB |
+| Collaborative text, many small values | 40–160 MB |
+| Atomic strings, numbers, lists of records | 6–30 MB |
+
+Collaborative text keeps one operation per character, each with its own id and
+predecessor, so 1 MB of text is a million operations in memory even though it
+compresses well on disk. An atomic string is one operation. A wasm instance has
+4 GB; a document that exceeds it ends that call with `RuntimeError:
+unreachable`, and every later call on the instance, for every document in the
+process, throws `Module terminated` until the process (or browser page)
+restarts. Wasm memory also never shrinks: a single 2 GB load keeps 2 GB until
+then.
+
+MindooDB guards against this in two ways:
+
+- **Large strings are atomic by default.** A new plain string of 64 KB or more
+  (`LARGE_STRING_ATOMIC_THRESHOLD`) is stored as an atomic string. Write
+  `MindooValue.text(...)` for a large text that people really edit together.
+- **Assigning a long string to a text field edits it.** `data.body = newBody`
+  on a field that already holds text stores only the changed part, like
+  `d.updateText()`, once the old or new text has 1 KB or more. Shorter strings
+  still replace the value, so concurrent short assignments do not mix. Before, every assignment created a new text object with one
+  operation per character and kept the old one in the history; twenty
+  rewrites of a 1 MB field loaded with about 2.5 GB.
+
+A host can also cap what one document load may cost with
+`setDocumentLoadBudget(bytes)`: MindooDB counts the operations in the stored
+snapshot and changes from their binary headers (no load needed) and throws
+`DocumentTooLargeError` instead of loading a document whose estimate exceeds
+the budget. Keep documents that receive many changes snapshotted, too: replayed
+one entry at a time, many small changes cost time rather than memory
+([§6.3](#63-plan-for-growth-before-you-need-to)).
 
 ---
 
@@ -743,11 +786,13 @@ gives you one kind of string and one kind of number, and their defaults are
 right for some fields and wrong for others:
 
 - A **plain string** is collaborative text. Concurrent text edits
-  (`updateText()`, `textSplice`, editor and App SDK text patches) are merged
-  character by character. That is right for titles, notes and bodies. For a
-  `status` that one user changes from `"open"` to `"closed"` while another
-  changes it to `"blocked"` through a text edit, it can produce a mix of both
-  words.
+  (`updateText()`, `textSplice`, editor and App SDK text patches, and a string
+  of 1 KB or more assigned to a text field) are merged character by character. That is right
+  for titles, notes and bodies. For a `status` that one user changes from
+  `"open"` to `"closed"` while another changes it to `"blocked"` through a text
+  edit, it can produce a mix of both words. From 64 KB on, a new plain string
+  is stored atomic instead ([§6.6](#66-keep-large-values-cheap-to-load));
+  `MindooValue.text(...)` keeps a large text collaborative.
 - A **plain number** is last-writer-wins. Two users who both read `votes: 4`
   and save `5` lose a vote.
 - An **ISO date written as a string** is text, not a date.
@@ -761,7 +806,7 @@ value is written: `createDocument({ initialValues })` / `documents.create({ set
 
 | Field holds | Write it as | Merges | Reads back as |
 |---|---|---|---|
-| Prose: titles, notes, bodies | plain string, changed with `updateText()` / `textSplice` | character by character | string |
+| Prose: titles, notes, bodies | plain string (`MindooValue.text()` from 64 KB), changed with `updateText()` / `textSplice` / assignment | character by character | string |
 | Ids, status and enum values, URLs, hashes, stored cursors | `MindooValue.atomic("open")` | whole value, one concurrent write wins | string |
 | Tallies several people change: votes, likes, stock, seats | `MindooValue.counter(0)`, then `incrementCounter()` / `counterIncrement` | concurrent increments are summed | number |
 | Dates and times | `MindooValue.timestamp(date)` | whole value | `Date` from `getData()`, ISO 8601 string through the App SDK |
@@ -1110,6 +1155,9 @@ Protocol](network-sync-protocol.md).
       tallies as counters changed only by `counterIncrement`, dates as
       `MindooValue.timestamp()` — and rewritten with the same helper
       ([§7.6](#76-pick-the-value-type-that-merges-the-way-you-mean)).
+- [ ] Large texts people edit together are created with `MindooValue.text()`;
+      other large strings are left atomic or stored as attachments
+      ([§6.6](#66-keep-large-values-cheap-to-load)).
 - [ ] Query filters on timestamp fields compare against ISO 8601 UTC strings.
 - [ ] Positions in collaborative text (comments, highlights) are stored as text
       cursors, not indexes, with ranges anchored on their last character.

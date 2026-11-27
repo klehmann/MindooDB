@@ -45,10 +45,42 @@ export interface MindooTimestampValue {
   value: number | string;
 }
 
+/**
+ * Collaborative text, merged character by character. A plain string is
+ * collaborative text as well, except from {@link LARGE_STRING_ATOMIC_THRESHOLD}
+ * characters on: those are stored atomic unless written with this tag.
+ */
+export interface MindooTextValue {
+  $mindoo: "text";
+  value: string;
+}
+
 export type MindooTypedValue =
   | MindooAtomicValue
   | MindooCounterValue
-  | MindooTimestampValue;
+  | MindooTimestampValue
+  | MindooTextValue;
+
+/**
+ * Plain strings of at least this many characters are written as atomic
+ * strings instead of collaborative text. Collaborative text keeps one
+ * Automerge operation per character, which costs 100–500 bytes of memory per
+ * character whenever the document is loaded; a 10 MB text alone exceeds what
+ * a WebAssembly instance can hold. A larger string that people really edit
+ * together is written with {@link MindooValue.text}; assigning a string to a
+ * field that already holds text keeps it text and stores only the change.
+ */
+export const LARGE_STRING_ATOMIC_THRESHOLD = 64 * 1024;
+
+/**
+ * A string assigned to a field that already holds collaborative text is
+ * stored as a splice of the changed part (like `updateText()`) when the old or
+ * the new text has at least this many characters. Shorter strings are
+ * replaced as a whole, as before, so two concurrent assignments of a short
+ * value still end with one of them instead of a mix of both. Long texts are
+ * where a whole rewrite costs: one new operation per character, kept forever.
+ */
+export const TEXT_ASSIGN_SPLICE_THRESHOLD = 1024;
 
 export type MindooTypedValueKind = MindooTypedValue["$mindoo"];
 
@@ -56,7 +88,8 @@ export type MindooTypedValueKind = MindooTypedValue["$mindoo"];
 export const MindooValue = {
   /**
    * An atomic string: use it for identifiers, status and enum values, URLs,
-   * hashes and stored text cursors. Plain strings are collaborative text,
+   * hashes and stored text cursors. Plain strings (below
+   * {@link LARGE_STRING_ATOMIC_THRESHOLD} characters) are collaborative text,
    * where two concurrent changes of `"open"` to `"closed"` and `"blocked"` can
    * interleave into a mix of both words.
    */
@@ -76,6 +109,19 @@ export const MindooValue = {
   counter(value = 0): MindooCounterValue {
     assertCounterAmount(value, "MindooValue.counter value");
     return { $mindoo: "counter", value };
+  },
+
+  /**
+   * Collaborative text, merged character by character with concurrent edits.
+   * Plain strings already are, up to {@link LARGE_STRING_ATOMIC_THRESHOLD}
+   * characters; use this for a larger text that people edit together. Change
+   * it later with `updateText()` or text splices.
+   */
+  text(value: string): MindooTextValue {
+    if (typeof value !== "string") {
+      throw new Error("MindooValue.text value must be a string");
+    }
+    return { $mindoo: "text", value };
   },
 
   /** A timestamp from a `Date`, epoch milliseconds or an ISO 8601 string. */
@@ -139,9 +185,14 @@ export function parseTypedValue(value: Record<string, unknown>): MindooTypedValu
         $mindoo: "timestamp",
         value: toTimestampDate(value.value, 'Typed value "timestamp"').getTime(),
       };
+    case "text":
+      if (typeof value.value !== "string") {
+        throw new Error('Typed value "text" needs a string value');
+      }
+      return { $mindoo: "text", value: value.value };
     default:
       throw new Error(
-        `Unknown typed value ${JSON.stringify(kind)}; the "${MINDOO_VALUE_TAG}" key is reserved for MindooValue.atomic/counter/timestamp`,
+        `Unknown typed value ${JSON.stringify(kind)}; the "${MINDOO_VALUE_TAG}" key is reserved for MindooValue.atomic/counter/timestamp/text`,
       );
   }
 }

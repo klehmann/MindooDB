@@ -420,6 +420,15 @@ export {
   DeviceAccessRevokedError,
   isDeviceAccessRevokedError,
 } from "./errors";
+export {
+  DocumentTooLargeError,
+  isDocumentTooLargeError,
+  setDocumentLoadBudget,
+  getDocumentLoadBudget,
+  estimateDocumentLoad,
+  countChunkOps,
+  type DocumentLoadEstimate,
+} from "./documentLoadGuard";
 
 // Cache
 export type { LocalCacheStore } from "./cache/LocalCacheStore";

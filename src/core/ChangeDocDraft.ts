@@ -460,6 +460,7 @@ export function fieldTypeOf(
   if (Array.isArray(value)) return "list";
   const tag = (value as Record<string, unknown>).$mindoo;
   if (tag === "atomic" || tag === "counter" || tag === "timestamp") return tag;
+  if (tag === "text") return "text";
   return "map";
 }
 
