@@ -53,7 +53,7 @@ import {
   openSealedValueWithKeys,
   type SealedValue,
 } from "./userkeys/sealedValues";
-import { openBundleRange } from "./userkeys/sealedCrypto";
+import { openBundleRangeWithExtra } from "./userkeys/sealedCrypto";
 
 /** Compare form of raw key bytes. */
 function bytesKey(bytes: Uint8Array): string {
@@ -97,6 +97,7 @@ import { DirectoryAdminKeyResolver } from "./accesscontrol/directoryAdminResolve
 import { signingKeysEqual } from "./accesscontrol/DirectoryStateNode";
 import { extractActiveKeyPairs } from "./accesscontrol/grantKeys";
 import * as shares from "./personalShares";
+import * as teamShares from "./teamShares";
 import { namedExport } from "./utils/dynamicImportInterop";
 
 /**
@@ -203,13 +204,16 @@ export class BaseMindooTenant implements MindooTenant {
   /** Per sealed key id: older recipient blocks already tried. */
   private readonly sealedExplored = new Map<string, Set<string>>();
   /**
-   * Per sealed key id: keys of extra `doc_create` entries (bundle -> keys).
-   * Two replicas (or two concurrent writers on one) that create the same id
-   * with `assumeUniqueId` each seal their own document key; both creates stay
-   * in the document, so both keys are needed to read it
-   * (see {@link ingestForkedSealedCreates}).
+   * Per sealed key id: extra decryption keys outside the series (source ->
+   * keys with their epoch). Two replicas (or two concurrent writers on one)
+   * that create the same id with `assumeUniqueId` each seal their own document
+   * key; two members that rotate the same series while apart each seal their
+   * own new generation. Both stay in the document, so both keys are needed to
+   * read what was written with them (see {@link ingestForkedSealedCreates}).
+   * Sources: a block's bundle, `extra:<bundle>` for a block's `extra` field,
+   * `displaced` for a generation a concurrent block replaced in the series.
    */
-  private readonly sealedForkKeys = new Map<string, Map<string, Uint8Array[]>>();
+  private readonly sealedForkKeys = new Map<string, Map<string, Array<{ epoch: number; key: Uint8Array }>>>();
   /**
    * Private halves of deposit keys this session can open, by fingerprint
    * (see userkeys/depositKeys.ts). Held in memory only, like the sealed series:
@@ -813,6 +817,53 @@ export class BaseMindooTenant implements MindooTenant {
     return record;
   }
 
+  async publishTeamShares(
+    mailboxId: string,
+    depositKeys: Record<string, shares.PersonalShareDepositKey>,
+  ): Promise<teamShares.TeamSharesRecord> {
+    const directory = await this.openDirectory();
+    const current = await directory.getTeamShares?.(mailboxId);
+    const record: teamShares.TeamSharesRecord = {
+      form: teamShares.TEAM_SHARES_FORM,
+      mailboxId,
+      revision: (current?.revision ?? 0) + 1,
+      depositKeys: { ...(current?.depositKeys ?? {}), ...depositKeys },
+      writtenAt: Date.now(),
+    };
+    for (const [prefix, key] of Object.entries(record.depositKeys)) {
+      if (prefix !== "tmail_" && prefix !== "tcal_") throw new Error(`team shares: "${prefix}" is not a team database prefix`);
+      if (!key?.publicKey || !key?.fingerprint) throw new Error(`team shares: deposit key for "${prefix}" is incomplete`);
+    }
+    const db = await this.openDB(USER_DIRECTORY_DB_ID);
+    await db.syncStoreChanges();
+    // Own older records of this team go; other members' records stay theirs.
+    const me = await this.getCurrentUserId();
+    const old: string[] = [];
+    for (const id of await db.getAllDocumentIds({ idPrefix: teamShares.TEAM_SHARES_DOC_ID_PREFIX.slice(0, -1) })) {
+      try {
+        const doc = await db.getDocument(id);
+        const parsed = teamShares.parseTeamShares(doc.getData() as Record<string, unknown>);
+        const create = (await db.getStore().findNewEntriesForDoc([], id)).find((m) => m.entryType === "doc_create");
+        if (parsed?.mailboxId === mailboxId && create?.createdByPublicKey === me.userSigningPublicKey) old.push(id);
+      } catch {
+        // not readable
+      }
+    }
+    await db.createDocument({
+      idPrefix: teamShares.TEAM_SHARES_DOC_ID_PREFIX.slice(0, -1),
+      decryptionKeyId: PUBLIC_INFOS_KEY_ID,
+      initialValues: JSON.parse(JSON.stringify(record)) as Record<string, unknown>,
+    });
+    for (const id of old) {
+      try {
+        await db.deleteDocument(id);
+      } catch {
+        // already gone
+      }
+    }
+    return record;
+  }
+
   /** This person's current delegation record from the local `userdirectory`, or null. */
   async getOwnPersonalShares(): Promise<shares.PersonalSharesRecord | null> {
     const grant = await this.getOwnGrantDocId();
@@ -896,6 +947,17 @@ export class BaseMindooTenant implements MindooTenant {
     recipients: EntryRecipients,
     keys: CryptoKey[],
   ): Promise<Array<{ epoch: number; key: Uint8Array }> | null> {
+    const opened = await this.openSealedBlockWithExtra(recipients, keys);
+    return opened?.range ?? null;
+  }
+
+  private async openSealedBlockWithExtra(
+    recipients: EntryRecipients,
+    keys: CryptoKey[],
+  ): Promise<{
+    range: Array<{ epoch: number; key: Uint8Array }>;
+    extra: Array<{ epoch: number; key: Uint8Array }>;
+  } | null> {
     // A deposit key is known by fingerprint: try it first when a wrap names it.
     const preferred = allRecipientWraps(recipients)
       .map((wrap) => this.depositUnwrapKeys.get(wrap.keyFingerprint))
@@ -903,7 +965,7 @@ export class BaseMindooTenant implements MindooTenant {
     if (preferred.length > 0) keys = [...preferred, ...keys.filter((key) => !preferred.includes(key))];
     for (const key of keys) {
       try {
-        return await openBundleRange({ crypto: this.cryptoAdapter, recipients, privateKey: key });
+        return await openBundleRangeWithExtra({ crypto: this.cryptoAdapter, recipients, privateKey: key });
       } catch {
         // try next key
       }
@@ -919,8 +981,16 @@ export class BaseMindooTenant implements MindooTenant {
   ): void {
     const byEpoch = new Map<number, Uint8Array>();
     const current = this.getSealedSeries(keyId);
+    const displaced: Array<{ epoch: number; key: Uint8Array }> = [];
     for (const entry of preferRange ? current : range) byEpoch.set(entry.epoch, entry.key);
-    for (const entry of preferRange ? range : current) byEpoch.set(entry.epoch, entry.key);
+    for (const entry of preferRange ? range : current) {
+      const before = byEpoch.get(entry.epoch);
+      // Two keys for one epoch: concurrent rotations. The other stays a
+      // decryption candidate, documents written with it remain readable.
+      if (before && bytesKey(before) !== bytesKey(entry.key)) displaced.push({ epoch: entry.epoch, key: before });
+      byEpoch.set(entry.epoch, entry.key);
+    }
+    if (displaced.length) this.addSealedForkKeys(keyId, "displaced", displaced);
     const epochs = [...byEpoch.keys()].sort((a, b) => b - a);
     this.sealedGenerations.set(keyId, epochs.map((epoch) => byEpoch.get(epoch)!));
     this.sealedEpochs.set(keyId, epochs);
@@ -948,14 +1018,15 @@ export class BaseMindooTenant implements MindooTenant {
       // to read a document they just sealed.
       return;
     }
-    let range = await this.openSealedBlock(recipients, keys);
-    if (!range) {
+    let opened = await this.openSealedBlockWithExtra(recipients, keys);
+    if (!opened) {
       const fresh = await this.freshSealedUnwrapKeysIfDue();
-      if (fresh?.length) range = await this.openSealedBlock(recipients, fresh);
+      if (fresh?.length) opened = await this.openSealedBlockWithExtra(recipients, fresh);
     }
-    if (range) {
-      this.mergeSealedSeries(keyId, range, true);
+    if (opened) {
+      this.mergeSealedSeries(keyId, opened.range, true);
       this.sealedBlocks.set(keyId, recipients.bundle);
+      if (opened.extra.length) this.addSealedForkKeys(keyId, `extra:${recipients.bundle}`, opened.extra);
       return;
     }
     // Newest wrap list is not for us (removed, or never added). Drop any
@@ -1073,9 +1144,13 @@ export class BaseMindooTenant implements MindooTenant {
     if (!this.sealedGenerations.get(keyId)?.length) return;
     const current = this.sealedBlocks.get(keyId);
     const known = this.sealedForkKeys.get(keyId);
+    // The series' top epoch: a block at that epoch (or above, not opened as the
+    // newest because of a later block at the same epoch) other than the current
+    // one is a concurrent rotation.
+    const topEpoch = Math.max(0, ...(this.sealedEpochs.get(keyId) ?? []));
     const creates = entries.filter(
       (entry): entry is { recipients: EntryRecipients; createdAt: number; entryType?: string } =>
-        entry.entryType === "doc_create" &&
+        (entry.entryType === "doc_create" || (entry.recipients?.epoch ?? 0) >= topEpoch) &&
         !!entry.recipients &&
         hasRecipientWraps(entry.recipients) &&
         entry.recipients.bundle !== current &&
@@ -1086,8 +1161,10 @@ export class BaseMindooTenant implements MindooTenant {
     if (keys.length === 0) return;
     const held = new Set(this.getSealedGenerations(keyId).map((key) => bytesKey(key)));
     for (const entry of creates) {
-      const range = await this.openSealedBlock(entry.recipients, keys);
-      const extra = (range ?? []).map((item) => item.key).filter((key) => !held.has(bytesKey(key)));
+      const opened = await this.openSealedBlockWithExtra(entry.recipients, keys);
+      const extra = [...(opened?.range ?? []), ...(opened?.extra ?? [])].filter(
+        (item) => !held.has(bytesKey(item.key)),
+      );
       let map = this.sealedForkKeys.get(keyId);
       if (!map) {
         map = new Map();
@@ -1096,6 +1173,34 @@ export class BaseMindooTenant implements MindooTenant {
       // Also remembered when nothing new came out: not opened again.
       map.set(entry.recipients.bundle, extra);
     }
+  }
+
+  /** Adds decryption keys outside the series (see {@link sealedForkKeys}). */
+  private addSealedForkKeys(keyId: string, source: string, keys: Array<{ epoch: number; key: Uint8Array }>): void {
+    let map = this.sealedForkKeys.get(keyId);
+    if (!map) {
+      map = new Map();
+      this.sealedForkKeys.set(keyId, map);
+    }
+    const seen = new Set([...map.values()].flat().map((item) => bytesKey(item.key)));
+    const fresh = keys.filter((item) => !seen.has(bytesKey(item.key)));
+    if (fresh.length) map.set(source, [...(map.get(source) ?? []), ...fresh]);
+  }
+
+  /**
+   * Keys of a sealed series that are not in the series itself: generations of
+   * concurrent rotations and of forked creates, with their epoch. A repair
+   * rotation puts them into the new block (`extra`), so members added later
+   * read what was written with them.
+   */
+  getSealedForkKeys(keyId: string): Array<{ epoch: number; key: Uint8Array }> {
+    const held = new Set(this.getSealedGenerations(keyId).map((key) => bytesKey(key)));
+    const out = new Map<string, { epoch: number; key: Uint8Array }>();
+    for (const item of [...(this.sealedForkKeys.get(keyId)?.values() ?? [])].flat()) {
+      const id = bytesKey(item.key);
+      if (!held.has(id)) out.set(id, item);
+    }
+    return [...out.values()];
   }
 
   getFactory(): MindooTenantFactory {
@@ -1458,7 +1563,7 @@ export class BaseMindooTenant implements MindooTenant {
       const generations = this.sealedGenerations.get(decryptionKeyId) ?? [];
       const forks = this.sealedForkKeys.get(decryptionKeyId);
       if (!forks?.size || generations.length === 0) return generations;
-      return [...generations, ...[...forks.values()].flat()];
+      return [...generations, ...[...forks.values()].flat().map((item) => item.key)];
     }
     const id = decryptionKeyId === "default" ? DEFAULT_TENANT_KEY_ID : decryptionKeyId;
     const versions = await this.keyBag.getAllKeys("doc", this.tenantId, id);

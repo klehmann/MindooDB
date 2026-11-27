@@ -5,9 +5,12 @@ import { MindooFilingStore, type FilingStoreOptions } from "./filing/MindooFilin
 import type { FilingIndex } from "./filing/FilingIndex";
 import { Automerge } from "./automerge-adapter";
 import { applyChangesInSlices } from "./applyChangesInSlices";
+import { assertDocumentLoadWithinBudget } from "./documentLoadGuard";
 import { ChangeDocDraft, diffTextSplice, fieldTypeOf, type DraftOp } from "./ChangeDocDraft";
 import {
+  LARGE_STRING_ATOMIC_THRESHOLD,
   MINDOO_VALUE_TAG,
+  TEXT_ASSIGN_SPLICE_THRESHOLD,
   assertCounterAmount,
   parseTypedValue,
   toTimestampDate,
@@ -248,12 +251,14 @@ import {
   DEFAULT_RECIPIENT_HISTORY,
   groupKeyDocIdOf,
   allRecipientWraps,
+  hasRecipientWraps,
   isSealedKeyId,
   sealedKeyDocId,
   sealedKeyId,
   type EntryRecipients,
   type RecipientChangeOptions,
   type RecipientChangeResult,
+  type RecipientRepairNeed,
   type RecipientSpec,
 } from "./userkeys/sealedTypes";
 import {
@@ -8839,7 +8844,7 @@ export class BaseMindooDB implements MindooDB {
       }
       return;
     }
-    this.assignHydrated(container, key, this.hydrateTypedValues(sourceValue));
+    this.assignHydrated(container, key, this.hydrateTypedValues(sourceValue, 0, { largeStringsAtomic: false }));
     if (Array.isArray(sourceValue)) {
       // The copied list holds plain strings; bring their marks along.
       this.forEachTextPath(sourceValue, path, (textPath) =>
@@ -11473,7 +11478,7 @@ export class BaseMindooDB implements MindooDB {
     const applyAll = (automergeDoc: MindooDocPayload) => {
       for (const [key, value] of Object.entries(update.set ?? {})) {
         if (value !== undefined) {
-          this.assignHydrated(automergeDoc, key, this.hydrateTypedValues(value));
+          this.assignValue(automergeDoc, automergeDoc, key, [key], value);
         }
       }
       for (const key of update.unset ?? []) {
@@ -12777,7 +12782,7 @@ export class BaseMindooDB implements MindooDB {
         }
         continue;
       }
-      this.assignHydrated(parent, key, this.hydrateTypedValues(op.value));
+      this.assignValue(automergeDoc, parent, key, op.path, op.value);
     }
   }
 
@@ -12954,6 +12959,52 @@ export class BaseMindooDB implements MindooDB {
    * (integers beyond the safe range, see hydrateTypedValues) are assigned
    * once more on their own.
    */
+  /**
+   * Writes `raw` (a plain or `MindooValue`-tagged value) at `key` of `parent`.
+   * A long string (see TEXT_ASSIGN_SPLICE_THRESHOLD) written over existing
+   * collaborative text edits that text: only the changed part is stored as a
+   * splice, so the field stays text, merges with concurrent typing, and is not
+   * rewritten character by character. Any other value (a short string, an
+   * atomic string, a number, an object, rich text) is assigned as before.
+   */
+  private assignValue(
+    automergeDoc: unknown,
+    parent: any,
+    key: string | number,
+    path: Array<string | number>,
+    raw: unknown,
+  ): void {
+    const current = parent?.[key];
+    const textValue =
+      typeof raw === "string"
+        ? raw
+        : raw !== null &&
+            typeof raw === "object" &&
+            !Array.isArray(raw) &&
+            (raw as Record<string, unknown>)[MINDOO_VALUE_TAG] === "text"
+          ? (parseTypedValue(raw as Record<string, unknown>).value as string)
+          : null;
+    if (
+      textValue !== null &&
+      typeof current === "string" &&
+      Math.max(current.length, textValue.length) >= TEXT_ASSIGN_SPLICE_THRESHOLD &&
+      !this.isRichTextAt(automergeDoc, path)
+    ) {
+      const splice = diffTextSplice(current, textValue);
+      if (splice) {
+        Automerge.splice(
+          automergeDoc as AutomergeTypes.Doc<MindooDocPayload>,
+          path as AutomergeTypes.Prop[],
+          splice.index,
+          splice.deleteCount,
+          splice.insert,
+        );
+      }
+      return;
+    }
+    this.assignHydrated(parent, key, this.hydrateTypedValues(raw));
+  }
+
   private assignHydrated(container: any, key: string | number, hydrated: unknown): void {
     container[key] = this.withoutNestedFloats(hydrated);
     this.restoreNestedFloats(container[key], hydrated);
@@ -12985,7 +13036,21 @@ export class BaseMindooDB implements MindooDB {
     }
   }
 
-  private hydrateTypedValues(value: unknown, depth = 0): unknown {
+  private hydrateTypedValues(
+    value: unknown,
+    depth = 0,
+    options: { largeStringsAtomic?: boolean } = {},
+  ): unknown {
+    // Large plain strings are atomic: collaborative text costs one Automerge
+    // operation per character (see LARGE_STRING_ATOMIC_THRESHOLD). Restores copy
+    // values back with their original types and pass largeStringsAtomic: false.
+    if (
+      typeof value === "string" &&
+      value.length >= LARGE_STRING_ATOMIC_THRESHOLD &&
+      options.largeStringsAtomic !== false
+    ) {
+      return new ((Automerge as any).ImmutableString as new (value: string) => unknown)(value);
+    }
     // Automerge stores a JS integer as int64, clamps larger ones (1e20 became
     // 9223372036854775807, which no reader can decode as a number) and reads
     // 2^53 − 1 and beyond back as BigInt: a 64-bit float holds what was written.
@@ -13008,7 +13073,7 @@ export class BaseMindooDB implements MindooDB {
       // Array.from, not map: map keeps the realm of an array that came from
       // another realm (structuredClone in a VM context, another frame), and
       // Automerge only assigns arrays that pass `instanceof Array`.
-      return Array.from(value, (entry) => this.hydrateTypedValues(entry, depth + 1));
+      return Array.from(value, (entry) => this.hydrateTypedValues(entry, depth + 1, options));
     }
     const record = value as Record<string, unknown>;
     if (Object.prototype.hasOwnProperty.call(record, MINDOO_VALUE_TAG)) {
@@ -13022,12 +13087,15 @@ export class BaseMindooDB implements MindooDB {
           return new Automerge.Counter(typed.value);
         case "timestamp":
           return toTimestampDate(typed.value, 'Typed value "timestamp"');
+        case "text":
+          // Collaborative text whatever its length.
+          return typed.value;
       }
     }
     const result: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(record)) {
       if (entry !== undefined) {
-        result[key] = this.hydrateTypedValues(entry, depth + 1);
+        result[key] = this.hydrateTypedValues(entry, depth + 1, options);
       }
     }
     return result;
@@ -13295,10 +13363,13 @@ export class BaseMindooDB implements MindooDB {
     patch: MindooJsonPatch,
   ): void {
     for (const operation of patch.set ?? []) {
-      this.setJsonValueAtPath(
+      const parent = this.ensureJsonParentAtPath(automergeDoc, operation.path);
+      this.assignValue(
         automergeDoc,
+        parent,
+        operation.path[operation.path.length - 1],
         operation.path,
-        this.hydrateTypedValues(structuredClone(operation.value)),
+        structuredClone(operation.value),
       );
     }
     for (const operation of patch.unset ?? []) {
@@ -16384,6 +16455,61 @@ export class BaseMindooDB implements MindooDB {
     return this.mutateRecipients(doc, "reveal", recipients, options);
   }
 
+  async recipientsNeedRepair(doc: MindooDoc): Promise<RecipientRepairNeed | null> {
+    const keyId = doc.getDecryptionKeyId();
+    if (!isSealedKeyId(keyId) || groupKeyDocIdOf(keyId, doc.getId()) !== undefined) return null;
+    const tenant = this.tenant as BaseMindooTenant;
+    if (tenant.getSealedGenerations(keyId).length === 0) return null;
+    const internalDoc = this.getCachedDocument(doc.getId()) ?? (await this.loadDocumentInternal(doc.getId()));
+    if (!internalDoc || internalDoc.isDeleted) return null;
+    const blocks = (await this.scanAllMetadata(this.store, { docId: doc.getId() }))
+      .map((entry) => entry.recipients)
+      .filter((block): block is EntryRecipients => !!block && hasRecipientWraps(block));
+    const newest = newestRecipientBlock(await this.scanAllMetadata(this.store, { docId: doc.getId() }));
+    if (!newest) return null;
+    const topBundles = new Set(blocks.filter((block) => block.epoch === newest.epoch).map((block) => block.bundle));
+    const wrapped = new Set(allRecipientWraps(newest).map((wrap) => wrap.keyFingerprint));
+    const map = readEncryptFor(internalDoc.doc as unknown as MindooDocPayload);
+    const missing: string[] = [];
+    const stale: string[] = [];
+    const activeSpecs: RecipientSpec[] = [];
+    const activeLabels: string[] = [];
+    for (const [id, entry] of Object.entries(map)) {
+      const label = entry.label ?? id;
+      if (entry.removedAt) {
+        if (entry.keyFingerprint && wrapped.has(entry.keyFingerprint)) stale.push(label);
+        continue;
+      }
+      if (entry.keyFingerprint && wrapped.has(entry.keyFingerprint)) continue;
+      activeSpecs.push(entry.kind === "device" ? { device: entry.keyFingerprint ?? id, label: entry.label } : label);
+      activeLabels.push(label);
+    }
+    if (activeSpecs.length) {
+      // The stored fingerprint may be an older User-Key generation: count the
+      // reader as wrapped when the newest block wraps their current key.
+      const resolved = await resolveRecipientSpecs({
+        tenant,
+        specs: activeSpecs,
+        options: { includeSelf: false, strict: false },
+        addedBy: "",
+        now: semanticNow(),
+      });
+      const current = new Set(resolved.targets.filter((target) => wrapped.has(target.keyFingerprint)).map((target) => target.id));
+      for (const [index, label] of activeLabels.entries()) {
+        const target = resolved.targets.find(
+          (candidate) => candidate.id === label || candidate.label === label || candidate.stableId === label,
+        );
+        if (!target || !current.has(target.id)) missing.push(activeLabels[index]);
+      }
+    }
+    const need = { forked: topBundles.size > 1, missing, stale };
+    return need.forked || missing.length || stale.length ? need : null;
+  }
+
+  async repairRecipients(doc: MindooDoc, options?: RecipientChangeOptions): Promise<RecipientChangeResult> {
+    return this.mutateRecipients(doc, "repair", [], options);
+  }
+
   async canChangeRecipients(
     doc: MindooDoc,
     next: RecipientSpec[],
@@ -16397,7 +16523,7 @@ export class BaseMindooDB implements MindooDB {
 
   private async mutateRecipients(
     doc: MindooDoc,
-    mode: "add" | "remove" | "set" | "reveal",
+    mode: "add" | "remove" | "set" | "reveal" | "repair",
     specs: RecipientSpec[],
     options?: RecipientChangeOptions,
   ): Promise<RecipientChangeResult> {
@@ -16425,16 +16551,20 @@ export class BaseMindooDB implements MindooDB {
     const signer =
       options?.signingKeyPair?.publicKey ??
       (await this.tenant.getCurrentUserId()).userSigningPublicKey;
-    const resolved = await resolveRecipientSpecs({
-      tenant,
-      specs,
-      options: {
-        includeSelf: mode === "set" ? options?.includeSelf !== false : false,
-        strict: options?.strict,
-      },
-      addedBy: signer,
-      now,
-    });
+    // A repair names nobody: it re-seals for the readers already on the list.
+    const resolved =
+      mode === "repair"
+        ? { targets: [] as ResolvedWrapTarget[], skipped: [] as Awaited<ReturnType<typeof resolveRecipientSpecs>>["skipped"] }
+        : await resolveRecipientSpecs({
+            tenant,
+            specs,
+            options: {
+              includeSelf: mode === "set" ? options?.includeSelf !== false : false,
+              strict: options?.strict,
+            },
+            addedBy: signer,
+            now,
+          });
     const currentMap = readEncryptFor(
       internalDoc.doc as unknown as MindooDocPayload,
     );
@@ -16500,7 +16630,9 @@ export class BaseMindooDB implements MindooDB {
       (mode === "add" || mode === "set") &&
       addedTargets.length > 0 &&
       (options?.history ?? DEFAULT_RECIPIENT_HISTORY) === "none";
-    const rotate = removedStableIds.length > 0 || withoutHistory;
+    // A repair (after concurrent recipient changes) always seals a new
+    // generation for exactly the current readers.
+    const rotate = removedStableIds.length > 0 || withoutHistory || mode === "repair";
     const heldSeries = tenant.getSealedSeries
       ? tenant.getSealedSeries(internalDoc.decryptionKeyId)
       : tenant
@@ -16614,6 +16746,8 @@ export class BaseMindooDB implements MindooDB {
       generations,
       targets: remaining,
       epoch,
+      // Keys of concurrent branches travel along, for readers added later.
+      extra: tenant.getSealedForkKeys(internalDoc.decryptionKeyId),
     });
     tenant.rememberSealedGenerations(
       internalDoc.decryptionKeyId,
@@ -17563,6 +17697,8 @@ export class BaseMindooDB implements MindooDB {
 
     // Load the snapshot first if we have one
     let doc: AutomergeTypes.Doc<MindooDocPayload> | undefined = undefined;
+    // The snapshot bytes the document was loaded from, for the load budget.
+    let loadedSnapshotBytes: Uint8Array | null = null;
     if (startFromSnapshot && snapshotMeta) {
       this.logger.debug(`Loading snapshot for document ${docId}`);
       const snapshotLoadStartedAt = Date.now();
@@ -17613,9 +17749,13 @@ export class BaseMindooDB implements MindooDB {
           // This deserializes a full document snapshot from binary data
           // According to Automerge docs: load() is equivalent to init() followed by loadIncremental()
           this.logger.debug(`Loading snapshot into Automerge document`);
+          // A document too large for this process must not reach Automerge:
+          // a panicking load ends the wasm instance for every document.
+          assertDocumentLoadWithinBudget(docId, decryptedSnapshot, []);
           const automergeStartedAt = Date.now();
           doc = Automerge.load<MindooDocPayload>(decryptedSnapshot);
           automergeTime += Date.now() - automergeStartedAt;
+          loadedSnapshotBytes = decryptedSnapshot;
           if (this.isDebugEnabled())
             this.logger.debug(
               `Successfully loaded snapshot, document heads: ${JSON.stringify(Automerge.getHeads(doc))}`,
@@ -17635,6 +17775,7 @@ export class BaseMindooDB implements MindooDB {
               `Snapshot ${snapshotData.id} heads do not match declared snapshotHeadHashes, loading from scratch`,
             );
             doc = undefined;
+            loadedSnapshotBytes = null;
             startFromSnapshot = false;
           } else {
             // Register the snapshot's automerge hash -> entry ID mapping
@@ -17808,6 +17949,7 @@ export class BaseMindooDB implements MindooDB {
           this.logger.debug(
             `Applying ${changeBytes.length} changes to document ${docId} using applyChangesInSlices`,
           );
+          assertDocumentLoadWithinBudget(docId, loadedSnapshotBytes, changeBytes);
           try {
             const automergeStartedAt = Date.now();
             // In slices: one huge batch can exhaust Automerge's memory

@@ -1,0 +1,12 @@
+{"engine":"webkit","id":"large-strings__fields1_size1000000__text","path":"incremental","loadMs":1164,"wasmMB":504}
+{"engine":"webkit","id":"large-strings__fields1_size1000000__text","path":"snapshot","loadMs":453,"wasmMB":125.3}
+{"engine":"webkit","id":"full-rewrites__size1000000_rewrites20__text","path":"incremental","loadMs":19258,"wasmMB":504}
+{"engine":"webkit","id":"full-rewrites__size1000000_rewrites20__text","path":"snapshot","loadMs":7384,"wasmMB":2506.9}
+{"engine":"webkit","id":"small-strings__count100000__text","path":"incremental","loadMs":3129,"wasmMB":1005.5}
+{"engine":"webkit","id":"small-strings__count100000__text","path":"snapshot","loadMs":1345,"wasmMB":283.8}
+{"engine":"webkit","id":"object-list__rows10000__text","path":"incremental","loadMs":1721,"wasmMB":614.1}
+{"engine":"webkit","id":"object-list__rows10000__text","path":"snapshot","loadMs":727,"wasmMB":181.1}
+{"engine":"webkit","id":"small-strings__count100000__atomic","path":"incremental","loadMs":566,"wasmMB":65.8}
+{"engine":"webkit","id":"small-strings__count100000__atomic","path":"snapshot","loadMs":274,"wasmMB":28.6}
+{"engine":"webkit","id":"large-strings__fields1_size10000000__text","path":"incremental","error":"RuntimeError: Unreachable code should not be executed (evaluating 'wasm.automerge_loadIncremental(this.__wbg_ptr, data)')","ms":6994,"wasmMB":3353.1}
+{"engine":"webkit","id":"large-strings__fields1_size10000000__text","path":"snapshot","loadMs":3964,"wasmMB":1264.3}

@@ -125,6 +125,15 @@ export interface EntryRecipients {
   bundleFrom?: number;
   /** Bundles for readers with a history limit (`historyFrom`). */
   partial?: EntryRecipientTier[];
+  /**
+   * Keys of concurrent rotations (two members rotated the same series while
+   * apart, so one epoch got two keys): encrypted with the same bundle key as
+   * `bundle`, each as 4-byte big-endian epoch + 32-byte key. Readers of the
+   * whole-history bundle keep them as extra decryption candidates, so documents
+   * written in either branch stay readable for members added later. Older
+   * clients ignore the field.
+   */
+  extra?: string;
 }
 
 /** Whether a recipient block wraps to anyone (whole history or partial). */
@@ -138,6 +147,16 @@ export function hasRecipientWraps(recipients: EntryRecipients | undefined): bool
 export function allRecipientWraps(recipients: EntryRecipients | undefined): EntryRecipientWrap[] {
   if (!recipients) return [];
   return [...(recipients.wraps ?? []), ...(recipients.partial ?? []).flatMap((tier) => tier.wraps ?? [])];
+}
+
+/** What {@link MindooDB.recipientsNeedRepair} found. */
+export interface RecipientRepairNeed {
+  /** Two or more recipient blocks at the newest epoch (concurrent rotations). */
+  forked: boolean;
+  /** Labels of current readers without a wrap in the newest block. */
+  missing: string[];
+  /** Labels of removed readers who still have a wrap in the newest block. */
+  stale: string[];
 }
 
 export interface RecipientChangeResult {
