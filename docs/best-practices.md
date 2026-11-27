@@ -879,6 +879,53 @@ collaborative text (plain strings and rich text). App SDK apps use
 `db.documents.getTextCursors()` / `resolveTextCursors()` with the `read`
 capability.
 
+### 7.7 Keep fields that belong together consistent
+
+Automerge decides concurrent writes **per field**, not per change or per user.
+When two devices each change several fields offline, every field picks its own
+winner by operation id. The result is the same on every device, but it can mix
+both sides: Karsten writes `status: "PENDING", folder: "INBOX"`, Jane writes
+`status: "SENT", folder: "OUTBOX"`, and the document ends up with Jane's status
+and Karsten's folder. Which side wins a field depends on the order of the writes
+and on how much each device wrote before, not on time or on any business rule.
+
+Fields that are only valid together (status and folder, amount and currency,
+start and end, a reference and its version) need one of these patterns:
+
+| Pattern | How | Concurrent result | Trade-off |
+|---|---|---|---|
+| One atomic value | `MindooValue.atomic("PENDING;INBOX")` or `MindooValue.atomic(JSON.stringify({ status, folder }))` | one side's value as a whole | the parts are not summary-covered fields of their own; parse on read |
+| Replace a nested object as a whole | `data.state = { status: MindooValue.atomic("PENDING"), folder: MindooValue.atomic("INBOX") }` | one side's object as a whole | a concurrent edit of a single field inside the old object is lost without a conflict; never mix whole replacement with field edits on the same object |
+| Append-only history list | insert an entry at the front, trim the end: `data.states.unshift({ ... })`, then `data.states.splice(max)` | both entries survive, in a deterministic order | the list is briefly longer than `max` after a conflict; never edit an entry after inserting it |
+
+The history list keeps the losing write visible instead of hiding it in
+conflict metadata, which makes it the right choice when users should see that a
+concurrent change happened. "First entry wins" is as arbitrary as any other
+deterministic order, though: Automerge orders concurrent inserts at the same
+position by operation id. If a business rule decides (latest timestamp, `SENT`
+beats `PENDING`), put a `modifiedAt` and `modifiedBy` in each entry and apply
+the rule to the newest entries on read.
+
+```typescript
+const MAX_STATES = 5;
+
+await db.changeDoc(doc, (d) => {
+  const data = d.getData();
+  data.states.unshift({
+    status: MindooValue.atomic("PENDING"),
+    folder: MindooValue.atomic("INBOX"),
+    modifiedBy: MindooValue.atomic(currentUser),
+    modifiedAt: MindooValue.timestamp(new Date()),
+  });
+  if (data.states.length > MAX_STATES) data.states.splice(MAX_STATES);
+});
+```
+
+Whatever the pattern, the alternatives of a conflicting field remain in the
+history. `getDocumentConflictReport()` lists them with author and time, so an
+app or an admin tool can show what was overwritten ([DAG Conflict
+Analysis](dag-conflict-analysis.md)).
+
 ## 8. Building Apps for Haven
 
 Applications built on the App SDK run in a sandboxed iframe on a separate origin
@@ -1155,6 +1202,9 @@ Protocol](network-sync-protocol.md).
       tallies as counters changed only by `counterIncrement`, dates as
       `MindooValue.timestamp()` — and rewritten with the same helper
       ([§7.6](#76-pick-the-value-type-that-merges-the-way-you-mean)).
+- [ ] Fields that are only valid together are written as one atomic value, as
+      an object replaced as a whole, or as an append-only history list
+      ([§7.7](#77-keep-fields-that-belong-together-consistent)).
 - [ ] Large texts people edit together are created with `MindooValue.text()`;
       other large strings are left atomic or stored as attachments
       ([§6.6](#66-keep-large-values-cheap-to-load)).
