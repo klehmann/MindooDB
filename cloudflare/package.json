@@ -6,7 +6,8 @@
     "setup": "node scripts/setup.mjs",
     "config": "node scripts/config.mjs",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "node scripts/deploy.mjs",
+    "update": "node scripts/update.mjs"
   },
   "cloudflare": {
     "bindings": {
@@ -19,7 +20,7 @@
     }
   },
   "dependencies": {
-    "mindoodb": "^0.1.3"
+    "mindoodb": "0.2.1"
   },
   "devDependencies": {
     "wrangler": "4.149.0"

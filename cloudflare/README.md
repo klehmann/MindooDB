@@ -20,48 +20,100 @@ request (at most every 2 seconds), right away when the directory announces a
 change, and once more when it is about to deny a request.
 
 All logic lives in the `mindoodb` package (`mindoodb/cloudflare`); this
-folder only holds the Worker's configuration. To update, bump `mindoodb` in
-`package.json` and deploy again.
+folder only holds the Worker's configuration. Updating the server means
+installing a newer `mindoodb` and deploying again (see [Updating](#updating)).
 
 ## Requirements
 
-- A Cloudflare account on the **Workers Paid** plan. The server signs,
-  verifies and wraps keys on every sync request, and that does not fit the
-  free plan's CPU time per request.
-- Node.js 22+ on your machine for the one-time setup.
-- `mindoodb` 0.1.3 or later (`package.json` already asks for it).
+- A Cloudflare account on the **Workers Paid** plan (5 USD/month as of 2026).
+  The server signs, verifies and wraps keys on every sync request, and that
+  does not fit the free plan's CPU time per request.
+- Node.js 22+ on your machine for the setup and for updates.
 
 ## Deploy
 
+There are two ways. Both end with the same Worker; they differ in where its
+configuration lives and how it is updated later.
+
+| | Deploy button | From a copy of this folder |
+|---|---|---|
+| Configuration lives in | a new GitHub/GitLab repository of yours | a folder on your machine (keep it, e.g. in your own repository) |
+| Updates | merge a pull request that bumps `mindoodb`; Cloudflare deploys on push | `npm run update` |
+| Good for | one server that should stay current with little effort | several servers, scripted setups, servers without a Git host |
+
+Whichever you choose, keep the system admin identity that setup writes
+(`system-admin-*.identity.json`) and its password somewhere safe and **out of
+Git**. It is the only copy of the admin's private key.
+
+### A. Deploy button
+
 1. Click **Deploy to Cloudflare** above. Cloudflare copies this folder into a
-   new repository of yours and deploys the Worker (`<name>.<account>.workers.dev`).
-   The server has no identity yet; `/.well-known/mindoodb-server-info`
-   answers 503 until step 3.
+   new repository of yours, creates the R2 bucket and deploys the Worker
+   (`mindoodb-server.<account>.workers.dev`). The server has no identity yet:
+   `/.well-known/mindoodb-server-info` answers 503 until step 3.
 2. Clone the new repository and install:
    ```bash
    npm install
    npx wrangler login
    ```
-3. Create the server identity and a system administrator, and store them as
-   secrets of the deployed Worker:
+3. Create the server identity and a system administrator and store them as
+   secrets of the deployed Worker (continue with [Check it](#check-it)):
    ```bash
    npm run setup
    ```
-   This writes `system-admin-cn=sysadmin.identity.json` into the current directory. Keep it:
-   it is the only copy of the admin's private key, and you need it (with
-   its password) to create tenants. Use `--admin <name>` for another admin
-   name, or `--admin-public <identity.json>` to make an existing identity the
-   admin.
-   To start with other settings, e.g. a demo server, pass
-   `--config <config.json>` (see [Server settings](#server-settings-configjson)).
-4. Check it:
+
+### B. From a copy of this folder
+
+1. Copy the folder (not a clone of the whole MindooDB repository) and install:
    ```bash
-   curl https://<name>.<account>.workers.dev/.well-known/mindoodb-server-info
+   git clone --depth 1 https://github.com/klehmann/MindooDB.git
+   cp -R MindooDB/cloudflare mindoodb-server && cd mindoodb-server
+   npm install
+   npx wrangler login
+   ```
+2. Pick the Worker name (`"name"` in `wrangler.jsonc`, default
+   `mindoodb-server`; it becomes the host name), the browser origins
+   (`MINDOODB_CORS_ORIGIN`, see [Browser clients](#browser-clients)), and
+   create the bucket for large entries:
+   ```bash
+   npx wrangler r2 bucket create mindoodb-large-entries
+   ```
+3. Deploy. The server answers 503 until setup has run:
+   ```bash
+   npm run deploy
+   ```
+4. Create the server identity and the system admin:
+   ```bash
+   npm run setup                         # or: npm run setup -- --config demo.json
    ```
 
-Without the button: clone MindooDB, `cd cloudflare`, `npm install`,
-`npx wrangler login`, `npx wrangler r2 bucket create mindoodb-large-entries`
-(or remove the `r2_buckets` entry), `npm run setup`, `npm run deploy`.
+### What setup does
+
+`npm run setup` creates the server identity and a system administrator, then
+stores four secrets on the Worker (`wrangler secret put`, which also rolls out
+a new version): the server identity, its random password, the key from which
+sync tokens are derived, and the initial `config.json`. It asks for the admin
+password (or reads `MINDOODB_ADMIN_PASSWORD`) and writes
+`system-admin-cn=sysadmin.identity.json` into the current directory.
+
+Options: `--admin <name>` for another admin name, `--admin-public
+<identity.json>` to make an existing identity the admin, `--config <file>` to
+start with own rules, e.g. a demo server (see
+[Server settings](#server-settings-configjson)). Run setup only once per
+server: running it again replaces the server identity and its password, so
+the server can no longer open the tenant keys it stored, and clients that
+trust the old key refuse it.
+
+### Check it
+
+```bash
+curl https://mindoodb-server.<account>.workers.dev/.well-known/mindoodb-server-info
+npm run config -- --url https://mindoodb-server.<account>.workers.dev get
+```
+
+The first shows the server name and keys; the second proves that the admin
+identity and password work. Then publish a tenant from Haven ("Push to
+server") or the SDK.
 
 ### Own domain
 
@@ -79,8 +131,63 @@ path, so the host name only needs to reach the Worker.
 
 ### Browser clients
 
-Set `MINDOODB_CORS_ORIGIN` in `wrangler.jsonc` (or in the dashboard) to the
-origins of your web apps, comma-separated, e.g. `https://haven.example.com`.
+Set `MINDOODB_CORS_ORIGIN` in `wrangler.jsonc` to the origins of your web
+apps, comma-separated, e.g.
+`"https://haven.example.com,http://localhost:4174"`, and deploy. Set it in
+`wrangler.jsonc` rather than in the dashboard: every `wrangler deploy`
+replaces the dashboard's variables with the ones in the file. Native apps and
+Node clients do not need it.
+
+## Updating
+
+An update has up to two parts:
+
+- **Code:** a newer `mindoodb` package. This is the usual case.
+- **Worker configuration:** occasionally a release needs a change in
+  `wrangler.jsonc`, e.g. a new Durable Object class with its `migrations`
+  entry, a new binding or a new limit. The release notes say so; compare your
+  `wrangler.jsonc` with this folder's.
+
+Data stays where it is. Durable Object storage and R2 are not touched by a
+deploy, and every object brings its own tables up to date when it starts. The
+secrets (server identity, admin, config) stay as they are.
+
+### With a copy of this folder
+
+```bash
+npm run update            # newest mindoodb release
+npm run update -- 0.2.1   # a specific release
+```
+
+The script installs the release (pinned exactly in `package.json`), shows the
+version change and deploys with the tag `mindoodb-<version>`, so
+`npx wrangler versions list` shows which release each Worker version runs.
+Check the server afterwards as under [Check it](#check-it). Commit
+`package.json` and `package-lock.json` if you keep the folder in Git.
+
+### With the Deploy button's repository
+
+Cloudflare (Workers Builds) deploys every push to the repository's main
+branch. To update, change the `mindoodb` version in `package.json`, run
+`npm install` so the lock file follows, and push. The repository contains a
+Dependabot configuration that opens such a pull request every week when a new
+`mindoodb` release is out (enable Dependabot in the repository's settings on
+GitHub); merging it deploys the update.
+
+### Rolling back
+
+Every deploy creates a new Worker version; the previous ones stay available:
+
+```bash
+npx wrangler versions list                 # versions with their mindoodb tag
+npx wrangler rollback <version-id>         # serve an earlier version again
+```
+
+A rollback only switches the code; stored data stays as the newer version left
+it. That is safe as long as releases keep their storage readable by the
+previous release, which MindooDB does: storage changes only add tables,
+columns or entries. Durable Object class migrations cannot be undone; a
+release that adds one says so.
 
 ## Create tenants
 
