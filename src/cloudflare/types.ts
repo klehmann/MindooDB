@@ -101,4 +101,10 @@ export interface MindooCloudflareEnv {
   MINDOODB_RATE_LIMIT_SYSTEM?: RateLimitBinding;
   MINDOODB_RATE_LIMIT_TIMESTAMP?: RateLimitBinding;
   MINDOODB_RATE_LIMIT_PEER?: RateLimitBinding;
+  /** Invitation reads and join-request writes (unauthenticated). */
+  MINDOODB_RATE_LIMIT_INVITE?: RateLimitBinding;
+  /** Device discovery (`/device/*`): scans every tenant, so kept tight. */
+  MINDOODB_RATE_LIMIT_DEVICE?: RateLimitBinding;
+  /** Join-request status polls of waiting devices. */
+  MINDOODB_RATE_LIMIT_INVITE_STATUS?: RateLimitBinding;
 }

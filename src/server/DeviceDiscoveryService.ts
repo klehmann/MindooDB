@@ -24,9 +24,52 @@ const DEFAULT_TENANT_LOOKUP_CONCURRENCY = 4;
 /** Lookups slower than this are logged with the tenant id, to find the culprit. */
 const SLOW_TENANT_LOOKUP_MS = 2_000;
 
+/** What one tenant knows about a device signing key with an active grant. */
+export interface DeviceTenantMatch {
+  tenantId: string;
+  adminSigningPublicKey: string;
+  adminEncryptionPublicKey: string;
+  encryptionPublicKey: string;
+  username_hash?: string;
+  identity_hashes?: string[];
+  joinResponseWrapped?: string;
+}
+
 export interface DeviceDiscoveryOptions {
   tenantLookupTimeoutMs?: number;
   tenantLookupConcurrency?: number;
+  /**
+   * Look the key up in one tenant. Default: the tenant manager's directory of
+   * that tenant. Hosts whose directories live elsewhere (Cloudflare: one
+   * object per tenant directory) ask there instead.
+   */
+  lookupTenant?: (tenantId: string, signingPublicKey: string) => Promise<DeviceTenantMatch | null>;
+}
+
+/** {@link DeviceTenantMatch} for `signingPublicKey` from a loaded tenant's directory. */
+export async function lookupDeviceInTenant(
+  tenantManager: TenantManager,
+  tenantId: string,
+  signingPublicKey: string,
+): Promise<DeviceTenantMatch | null> {
+  const loaded = await tenantManager.getTenant(tenantId);
+  const lookup = await loaded.directory.getUserBySigningPublicKey(signingPublicKey);
+  if (!lookup?.encryptionPublicKey) return null;
+  return {
+    tenantId,
+    adminSigningPublicKey: loaded.context.config.adminSigningPublicKey,
+    adminEncryptionPublicKey: loaded.context.config.adminEncryptionPublicKey,
+    encryptionPublicKey: lookup.encryptionPublicKey,
+    username_hash:
+      typeof lookup.username === "string" && /^[a-f0-9]{64}$/i.test(lookup.username)
+        ? lookup.username
+        : undefined,
+    identity_hashes: lookup.identityHashes,
+    joinResponseWrapped:
+      typeof lookup.joinResponseWrapped === "string" && lookup.joinResponseWrapped.trim()
+        ? lookup.joinResponseWrapped.trim()
+        : undefined,
+  };
 }
 
 class TenantLookupTimeout extends Error {}
@@ -65,6 +108,7 @@ export class DeviceDiscoveryService {
 
   private readonly tenantLookupTimeoutMs: number;
   private readonly tenantLookupConcurrency: number;
+  private readonly lookupTenant: (tenantId: string, signingPublicKey: string) => Promise<DeviceTenantMatch | null>;
 
   constructor(
     private readonly tenantManager: TenantManager,
@@ -76,6 +120,8 @@ export class DeviceDiscoveryService {
       1,
       options.tenantLookupConcurrency ?? DEFAULT_TENANT_LOOKUP_CONCURRENCY,
     );
+    this.lookupTenant =
+      options.lookupTenant ?? ((tenantId, key) => lookupDeviceInTenant(this.tenantManager, tenantId, key));
   }
 
   /**
@@ -131,37 +177,8 @@ export class DeviceDiscoveryService {
     const signingPublicKey = authChallenge.signingPublicKey;
     const tenantIds = this.tenantManager.listTenants();
 
-    type Match = {
-      tenantId: string;
-      adminSigningPublicKey: string;
-      adminEncryptionPublicKey: string;
-      encryptionPublicKey: string;
-      username_hash?: string;
-      identity_hashes?: string[];
-      joinResponseWrapped?: string;
-    };
-    const matches: Match[] = [];
-
-    const lookupTenant = async (tenantId: string): Promise<Match | null> => {
-      const loaded = await this.tenantManager.getTenant(tenantId);
-      const lookup = await loaded.directory.getUserBySigningPublicKey(signingPublicKey);
-      if (!lookup?.encryptionPublicKey) return null;
-      return {
-        tenantId,
-        adminSigningPublicKey: loaded.context.config.adminSigningPublicKey,
-        adminEncryptionPublicKey: loaded.context.config.adminEncryptionPublicKey,
-        encryptionPublicKey: lookup.encryptionPublicKey,
-        username_hash:
-          typeof lookup.username === "string" && /^[a-f0-9]{64}$/i.test(lookup.username)
-            ? lookup.username
-            : undefined,
-        identity_hashes: lookup.identityHashes,
-        joinResponseWrapped:
-          typeof lookup.joinResponseWrapped === "string" && lookup.joinResponseWrapped.trim()
-            ? lookup.joinResponseWrapped.trim()
-            : undefined,
-      };
-    };
+    const matches: DeviceTenantMatch[] = [];
+    const lookupTenant = (tenantId: string) => this.lookupTenant(tenantId, signingPublicKey);
 
     // Tenants are checked a few at a time, each within its own time budget.
     // A lookup that times out keeps running in the background (it cannot be

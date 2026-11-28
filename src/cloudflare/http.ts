@@ -42,13 +42,18 @@ export type MatchedRoute =
   | { kind: "clusterMirrors" }
   | { kind: "publicInfosFingerprints"; tenantId: string }
   | { kind: "unsupported"; feature: string }
+  | { kind: "device"; step: "challenge" | "discover" }
   | { kind: "system"; path: string }
   | { kind: "peer"; path: string }
   | { kind: "tenantAuth"; tenantId: string; phase: "challenge" | "authenticate" }
   | { kind: "timestamp"; tenantId: string }
   | { kind: "sync"; tenantId: string; storeKind: StoreKind; name: SyncRouteName }
+  | { kind: "joinRequest"; tenantId: string; op: JoinRequestOp; id?: string }
   | { kind: "tenantNotFound"; tenantId: string }
   | { kind: "notFound" };
+
+/** Invitation / join-request routes (docs/invitations.md); all served by the tenant's `joinrequests` object. */
+export type JoinRequestOp = "invitation" | "submit" | "summary" | "status" | "withdraw";
 
 function decodeSegment(segment: string): string {
   try {
@@ -82,7 +87,12 @@ export function matchRoute(method: string, pathname: string): MatchedRoute {
     }
     return { kind: "notFound" };
   }
-  if (lower[0] === "device") return { kind: "unsupported", feature: "Device discovery" };
+  if (lower[0] === "device") {
+    if (m === "POST" && lower.length === 2 && (lower[1] === "challenge" || lower[1] === "discover")) {
+      return { kind: "device", step: lower[1] };
+    }
+    return { kind: "notFound" };
+  }
   if (lower[0] === "system") {
     if (lower[1] === "peer") return { kind: "peer", path: trimmed };
     return { kind: "system", path: trimmed };
@@ -97,6 +107,19 @@ export function matchRoute(method: string, pathname: string): MatchedRoute {
   }
   if (m === "POST" && lower.length === 3 && lower[1] === "timestamps" && lower[2] === "rfc3161") {
     return { kind: "timestamp", tenantId };
+  }
+  if (lower[1] === "invitations" && m === "GET" && lower.length === 3) {
+    return { kind: "joinRequest", tenantId, op: "invitation", id: segments[2] };
+  }
+  if (lower[1] === "join-requests") {
+    if (m === "POST" && lower.length === 2) return { kind: "joinRequest", tenantId, op: "submit" };
+    if (m === "POST" && lower.length === 3 && lower[2] === "summary") {
+      return { kind: "joinRequest", tenantId, op: "summary" };
+    }
+    if (m === "GET" && lower.length === 3) return { kind: "joinRequest", tenantId, op: "status", id: segments[2] };
+    if (m === "POST" && lower.length === 4 && lower[3] === "withdraw") {
+      return { kind: "joinRequest", tenantId, op: "withdraw", id: segments[2] };
+    }
   }
   if (lower.length === 4 && lower[1] === "sync") {
     const storeKind = lower[2] === "docs" ? StoreKind.docs : lower[2] === "attachments" ? StoreKind.attachments : null;

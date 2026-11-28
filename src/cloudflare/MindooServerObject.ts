@@ -13,7 +13,7 @@ import { MindooDBServerCore } from "../server/http/MindooDBServerCore";
 import { TenantManager } from "../server/TenantManager";
 import { CapabilityMatcher } from "../server/CapabilityMatcher";
 import { SystemAdminAuthService } from "../server/SystemAdminAuth";
-import { DeviceDiscoveryService } from "../server/DeviceDiscoveryService";
+import { DeviceDiscoveryService, type DeviceTenantMatch } from "../server/DeviceDiscoveryService";
 import { SyncEventBus } from "../server/SyncEventBus";
 import {
   isConfigBackupFilename,
@@ -195,7 +195,11 @@ export class MindooServerObject {
       tenantManager: this.tenantManager,
       systemAdminAuth: this.systemAdminAuth,
       capabilityMatcher: this.capabilityMatcher,
-      deviceDiscovery: new DeviceDiscoveryService(this.tenantManager, cryptoAdapter),
+      // Each tenant's directory lives in its own object: ask it whether the
+      // device key has a grant there.
+      deviceDiscovery: new DeviceDiscoveryService(this.tenantManager, cryptoAdapter, {
+        lookupTenant: (tenantId, signingPublicKey) => this.lookupDevice(tenantId, signingPublicKey),
+      }),
       syncEvents: new SyncEventBus(),
       configRepository: new StoredServerConfigRepository(this.dataStore),
       getServerConfig: () => this.serverConfig,
@@ -358,6 +362,12 @@ export class MindooServerObject {
         );
       case "system":
         return this.system(request, route.path);
+      case "device": {
+        const req = await this.parse(request, {});
+        return toResponse(
+          route.step === "challenge" ? await this.core.deviceChallenge(req) : await this.core.deviceDiscover(req),
+        );
+      }
       default:
         return jsonResponse(404, { error: "Not found" });
     }
@@ -372,6 +382,20 @@ export class MindooServerObject {
       throw new ParsedRejection(parsed);
     }
     return parsed;
+  }
+
+  /** Device discovery: the tenant's directory object looks the key up. */
+  private async lookupDevice(tenantId: string, signingPublicKey: string): Promise<DeviceTenantMatch | null> {
+    const response = await databaseObject(this.env, tenantId, "directory").fetch(
+      `${INTERNAL_ORIGIN}/internal/device-lookup`,
+      {
+        method: "POST",
+        headers: internalHeaders(tenantId, "directory"),
+        body: JSON.stringify({ signingPublicKey }),
+      },
+    );
+    if (!response.ok) throw new Error(`Device lookup in ${tenantId} failed with HTTP ${response.status}`);
+    return ((await response.json()) as { match: DeviceTenantMatch | null }).match;
   }
 
   /**
@@ -396,6 +420,8 @@ export class MindooServerObject {
       config,
       publicInfosKeys: keys.map((key) => bytesToBase64(key)),
       trustedServers,
+      // Limits of the join-request inbox (served by the tenant's objects).
+      joinRequests: this.serverConfig.joinRequests,
       clusterActive: this.autoSync && trustedServers.some((server) => Boolean(server.url)),
     });
   }
