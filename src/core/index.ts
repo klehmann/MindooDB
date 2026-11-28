@@ -418,6 +418,7 @@ export {
   DocumentNotFoundError,
   DocumentDeletedError,
   isDocumentMissingError,
+  isSymmetricKeyNotFound,
   MissingDependencyError,
   isMissingDependencyError,
   DeviceAccessRevokedError,

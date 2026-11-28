@@ -14,6 +14,17 @@ export class SymmetricKeyNotFoundError extends Error {
 }
 
 /**
+ * True when `error` is a {@link SymmetricKeyNotFoundError}, also across two
+ * module copies of mindoodb (checked by `name`).
+ */
+export function isSymmetricKeyNotFound(error: unknown): boolean {
+  return (
+    error instanceof SymmetricKeyNotFoundError ||
+    (error instanceof Error && error.name === "SymmetricKeyNotFoundError")
+  );
+}
+
+/**
  * Error thrown when a document id cannot be resolved in the database (no
  * `doc_create` entry exists). Callers that treat "missing" as a regular
  * outcome (e.g. probing several databases for an id) should catch this via
