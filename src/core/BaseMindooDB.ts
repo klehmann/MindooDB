@@ -185,6 +185,7 @@ import { semanticNow } from "./utils/timeSource";
 import {
   DocumentDeletedError,
   DocumentNotFoundError,
+  isSymmetricKeyNotFound,
   SymmetricKeyNotFoundError,
 } from "./errors";
 import {
@@ -15445,6 +15446,30 @@ export class BaseMindooDB implements MindooDB {
             await prefetchFrom(i + 1);
             continue;
           }
+          if (isSymmetricKeyNotFound(error)) {
+            // The index holds the document as readable, but a key it needs is
+            // not here (delegation per account: one group of the database is
+            // shared with this user, another is not; a key series that arrives
+            // only partly). Treat it like the missing-key case of the sync:
+            // drop any plaintext, mark the entry inaccessible, so a key that
+            // arrives later reveals it again, and emit an inaccessible
+            // tombstone, so the summary, full-text and view updates go on with
+            // the other documents instead of failing every query.
+            this.logger.warn(`Skipping document ${entry.docId}: ${(error as Error).message}`);
+            await this.markUndecryptableDocument(entry);
+            yieldedDocuments++;
+            yield {
+              doc: this.buildInaccessibleDoc(entry),
+              cursor: {
+                changeSeq: entry.changeSeq,
+                lastModified: entry.lastModified,
+                docId: entry.docId,
+                feedEpoch: this.changeFeedEpoch,
+              },
+            };
+            await prefetchFrom(i + 1);
+            continue;
+          }
           this.logger.error(`Error processing document ${entry.docId}:`, error);
           // Stop processing on error
           throw error;
@@ -18522,6 +18547,23 @@ export class BaseMindooDB implements MindooDB {
    * never materialized) and `getHeads() === []` — backed by an empty Automerge
    * document so it never touches the underlying ciphertext or the document cache.
    */
+  /**
+   * A document whose key is missing although the index holds it as readable:
+   * forget its plaintext and flip the index entry to `"inaccessible"` (as the
+   * missing-key branch of the sync does), so listings drop it and a key that
+   * arrives later reveals it through `reconcileKeyVisibility`.
+   */
+  private async markUndecryptableDocument(entry: DocumentIndexEntry): Promise<void> {
+    this.noteInaccessibleDocument(entry.docId);
+    const position = this.getDocIndexPosition(entry.docId);
+    const current = position === undefined ? undefined : this.index[position];
+    if (current?.accessState !== "visible") return;
+    await this.purgeMaterializedDocument(entry.docId);
+    this.updateIndex(entry.docId, current.lastModified, true, current.decryptionKeyId, "inaccessible");
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+  }
+
   private buildInaccessibleDoc(entry: DocumentIndexEntry): MindooDoc {
     const internalDoc: InternalDoc = {
       id: entry.docId,
