@@ -432,6 +432,7 @@ export {
   getDocumentLoadBudget,
   estimateDocumentLoad,
   countChunkOps,
+  APPLY_CHANGES_SLICE_OPS,
   type DocumentLoadEstimate,
 } from "./documentLoadGuard";
 

@@ -1,9 +1,13 @@
 import * as Automerge from "@automerge/automerge";
 
 import {
-  CHANGE_BYTES_PER_OP,
+  APPLY_CHANGES_SLICE_OPS,
   DocumentTooLargeError,
+  RETAINED_BYTES_PER_CHANGE,
+  RETAINED_BYTES_PER_OP,
   SNAPSHOT_BYTES_PER_OP,
+  STEP_BYTES_PER_CHANGE,
+  STEP_BYTES_PER_OP,
   assertDocumentLoadWithinBudget,
   countChunkOps,
   estimateDocumentLoad,
@@ -66,12 +70,44 @@ describe("documentLoadGuard", () => {
     expect(estimateDocumentLoad(null, atomic)!.ops).toBe(1);
   });
 
-  it("weighs snapshot ops and change ops by their measured costs", () => {
+  it("weighs snapshot ops, the ops that stay and the largest step by their measured costs", () => {
     const { doc } = changesOf([(d) => { d.v = "s".repeat(1_000); }]);
     const { changes } = changesOf([(d) => { d.w = "c".repeat(2_000); }]);
     const estimate = estimateDocumentLoad(Automerge.save(doc), changes)!;
     expect(estimate.ops).toBe(1_001 + 2_001);
-    expect(estimate.bytes).toBe(1_001 * SNAPSHOT_BYTES_PER_OP + 2_001 * CHANGE_BYTES_PER_OP);
+    expect(estimate.largestStepOps).toBe(2_001);
+    expect(estimate.bytes).toBe(
+      1_001 * SNAPSHOT_BYTES_PER_OP +
+        2_001 * RETAINED_BYTES_PER_OP +
+        RETAINED_BYTES_PER_CHANGE +
+        2_001 * STEP_BYTES_PER_OP +
+        STEP_BYTES_PER_CHANGE,
+    );
+  });
+
+  it("charges a long history by what stays, and only its most expensive step at the step rate", () => {
+    // 60 changes of 10,000 characters: 600,000 ops, applied in steps of 500,000.
+    const { changes } = changesOf(
+      Array.from({ length: 60 }, (_, i) => (d: Doc) => { d[`p${i}`] = "x".repeat(9_999); }),
+    );
+    const estimate = estimateDocumentLoad(null, changes)!;
+    expect(estimate.ops).toBe(600_000);
+    expect(estimate.largestStepOps).toBe(APPLY_CHANGES_SLICE_OPS);
+    expect(estimate.bytes).toBe(
+      600_000 * RETAINED_BYTES_PER_OP +
+        60 * RETAINED_BYTES_PER_CHANGE +
+        APPLY_CHANGES_SLICE_OPS * STEP_BYTES_PER_OP +
+        50 * STEP_BYTES_PER_CHANGE,
+    );
+  });
+
+  it("charges a single change above the step size as a step of its own", () => {
+    const { changes } = changesOf([
+      (d) => { d.v = "t".repeat(APPLY_CHANGES_SLICE_OPS + 10_000); },
+      (d) => { d.w = "small"; },
+    ]);
+    const estimate = estimateDocumentLoad(null, changes)!;
+    expect(estimate.largestStepOps).toBe(APPLY_CHANGES_SLICE_OPS + 10_001);
   });
 
   it("returns null for bytes it cannot read, so the guard does not block", () => {
@@ -85,7 +121,9 @@ describe("documentLoadGuard", () => {
     const { changes } = changesOf([(d) => { d.v = "t".repeat(10_000); }]);
     expect(() => assertDocumentLoadWithinBudget("doc1", null, changes)).not.toThrow(); // no budget
 
-    setDocumentLoadBudget(10_001 * CHANGE_BYTES_PER_OP);
+    setDocumentLoadBudget(
+      10_001 * (RETAINED_BYTES_PER_OP + STEP_BYTES_PER_OP) + RETAINED_BYTES_PER_CHANGE + STEP_BYTES_PER_CHANGE,
+    );
     expect(() => assertDocumentLoadWithinBudget("doc1", null, changes)).not.toThrow();
 
     setDocumentLoadBudget(1024 * 1024);
