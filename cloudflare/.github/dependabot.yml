@@ -1,0 +1,13 @@
+# Opens a pull request when a new mindoodb release is out. In a repository
+# created by the Deploy button, merging it deploys the update (Workers Builds).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    allow:
+      - dependency-name: mindoodb
+      - dependency-name: wrangler
+    commit-message:
+      prefix: "Update"
