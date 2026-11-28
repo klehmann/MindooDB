@@ -224,6 +224,7 @@ export type {
   QuarantineRecord,
 } from "./accesscontrol/materializationGuard";
 export { fingerprintPublicKeyPem, normalizePublicKeyPem } from "./userkeys/fingerprint";
+export { scopeSealedKeyId } from "./userkeys/scopedSealedKeys";
 
 // User ID types
 export type { PublicUserId, PrivateUserId } from "./userid";

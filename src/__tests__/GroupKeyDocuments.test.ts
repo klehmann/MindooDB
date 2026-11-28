@@ -13,6 +13,7 @@ import {
 } from "./_helpers/multiDevice";
 import { USER_DIRECTORY_DB_ID, type MindooDB } from "../core/types";
 import { DocumentNotFoundError } from "../core/errors";
+import { scopeSealedKeyId } from "../core/userkeys/scopedSealedKeys";
 
 async function publishUserKey(device: DeviceHandle): Promise<void> {
   await device.factory.ensureUserKeyPair!(device.user, device.password);
@@ -170,7 +171,7 @@ describe("group key documents (groupKeyDocId)", () => {
     const carolDb = await carol.tenant.openDB("chat-order-gens");
     const written = await carolDb.createDocument({ groupKeyDocId: group.getId(), initialValues: { text: "new" } });
     expect(written.getData().text).toBe("new");
-    const keyId = group.getDecryptionKeyId();
+    const keyId = scopeSealedKeyId(group.getDecryptionKeyId(), "chat-order-gens");
     const hex = (u: Uint8Array) => Buffer.from(u).toString("hex");
     const aliceGens = alice.tenant.getSealedGenerations!(keyId).map(hex);
     const carolGens = carol.tenant.getSealedGenerations!(keyId).map(hex);
@@ -208,9 +209,9 @@ describe("group key documents (groupKeyDocId)", () => {
     expect(await visibleIds(bobDb)).toEqual([]);
     // Alice still has the whole series (three generations) and writes with the newest.
     expect(await visibleIds(db)).toEqual([group.getId(), old.getId(), fresh.getId()].sort());
-    expect(alice.tenant.getSealedGenerations!(group.getDecryptionKeyId())).toHaveLength(3);
-    expect(alice.tenant.getSealedGenerations!(group.getDecryptionKeyId())[0]).toEqual(
-      carol.tenant.getSealedGenerations!(group.getDecryptionKeyId())[0],
+    expect(alice.tenant.getSealedGenerations!(scopeSealedKeyId(group.getDecryptionKeyId(), "chat-no-history"))).toHaveLength(3);
+    expect(alice.tenant.getSealedGenerations!(scopeSealedKeyId(group.getDecryptionKeyId(), "chat-no-history"))[0]).toEqual(
+      carol.tenant.getSealedGenerations!(scopeSealedKeyId(group.getDecryptionKeyId(), "chat-no-history"))[0],
     );
     const later = await db.createDocument({ groupKeyDocId: group.getId(), initialValues: { text: "later" } });
     await syncAll(fixture, "chat-no-history");
@@ -274,6 +275,6 @@ describe("group key documents (groupKeyDocId)", () => {
       const deviceDb = await device.tenant.openDB("chat-no-history-twice");
       expect(await visibleIds(deviceDb)).toEqual([group.getId()]);
     }
-    expect(alice.tenant.getSealedGenerations!(group.getDecryptionKeyId())).toHaveLength(3);
+    expect(alice.tenant.getSealedGenerations!(scopeSealedKeyId(group.getDecryptionKeyId(), "chat-no-history-twice"))).toHaveLength(3);
   });
 });
