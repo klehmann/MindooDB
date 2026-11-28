@@ -5,7 +5,7 @@ import { MindooFilingStore, type FilingStoreOptions } from "./filing/MindooFilin
 import type { FilingIndex } from "./filing/FilingIndex";
 import { Automerge } from "./automerge-adapter";
 import { applyChangesInSlices } from "./applyChangesInSlices";
-import { assertDocumentLoadWithinBudget } from "./documentLoadGuard";
+import { assertDocumentLoadWithinBudget, isDocumentTooLargeError } from "./documentLoadGuard";
 import { ChangeDocDraft, diffTextSplice, fieldTypeOf, type DraftOp } from "./ChangeDocDraft";
 import {
   LARGE_STRING_ATOMIC_THRESHOLD,
@@ -15260,6 +15260,25 @@ export class BaseMindooDB implements MindooDB {
           yield { doc, cursor: currentCursor };
           await prefetchFrom(i + 1);
         } catch (error) {
+          if (isDocumentTooLargeError(error)) {
+            // Too large to load in this process (setDocumentLoadBudget): emit
+            // it like an inaccessible document, so consumers (the summary
+            // update behind every query) drop it and go on instead of failing
+            // for every other document of the database.
+            this.logger.warn(`Skipping document ${entry.docId}: ${(error as Error).message}`);
+            yieldedDocuments++;
+            yield {
+              doc: this.buildInaccessibleDoc(entry),
+              cursor: {
+                changeSeq: entry.changeSeq,
+                lastModified: entry.lastModified,
+                docId: entry.docId,
+                feedEpoch: this.changeFeedEpoch,
+              },
+            };
+            await prefetchFrom(i + 1);
+            continue;
+          }
           this.logger.error(`Error processing document ${entry.docId}:`, error);
           // Stop processing on error
           throw error;
