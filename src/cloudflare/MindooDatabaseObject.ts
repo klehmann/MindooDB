@@ -35,11 +35,11 @@ import {
 import { TenantManager } from "../server/TenantManager";
 import { CapabilityMatcher } from "../server/CapabilityMatcher";
 import { SystemAdminAuthService } from "../server/SystemAdminAuth";
-import { DeviceDiscoveryService } from "../server/DeviceDiscoveryService";
+import { DeviceDiscoveryService, lookupDeviceInTenant } from "../server/DeviceDiscoveryService";
 import { SyncEventBus, type SyncChangeEvent } from "../server/SyncEventBus";
 import { buildAuthRateLimitKey, buildSyncRateLimitKey, buildTimestampRateLimitKey } from "../server/rateLimits";
 import { isEventStreamResponse, type ServerRequest, type SyncEventPublisher, type SyncEventStreamSpec } from "../server/http/types";
-import type { TenantConfig, TrustedServer } from "../server/types";
+import type { ServerConfig, TenantConfig, TrustedServer } from "../server/types";
 import { PeerAuthService } from "../server/peer/PeerAuthService";
 import { guardStoreAgainstPurgedDocuments } from "../core/appendonlystores/purgedDocumentGuard";
 import { StoreRpcServer } from "../core/appendonlystores/rpc/StoreRpcServer";
@@ -59,6 +59,7 @@ import {
   jsonResponse,
   matchRoute,
   toResponse,
+  type JoinRequestOp,
   toServerRequest,
 } from "./http";
 import {
@@ -95,6 +96,8 @@ interface TenantState {
   trustedServers: TrustedServer[];
   /** Peer replication runs; accepted writes are reported to the server object. */
   clusterActive: boolean;
+  /** `joinRequests` of the server's config.json (inbox limits). */
+  joinRequests?: ServerConfig["joinRequests"];
   loadedAt: number;
 }
 
@@ -233,6 +236,7 @@ export class MindooDatabaseObject {
       publicInfosKeys?: string[];
       trustedServers?: TrustedServer[];
       clusterActive?: boolean;
+      joinRequests?: ServerConfig["joinRequests"];
     };
     const state: TenantState = {
       exists: body.exists,
@@ -240,6 +244,7 @@ export class MindooDatabaseObject {
       publicInfosKeys: (body.publicInfosKeys ?? []).map((key) => base64ToBytes(key)),
       trustedServers: body.trustedServers ?? [],
       clusterActive: body.clusterActive === true,
+      joinRequests: body.joinRequests,
       loadedAt: Date.now(),
     };
 
@@ -250,7 +255,8 @@ export class MindooDatabaseObject {
       !this.tenantState ||
       this.dataStore.readText(configKey) !== configJson ||
       this.dataStore.readText(TRUSTED_SERVERS_KEY) !== trustedJson ||
-      this.tenantState.publicInfosKeys.map(String).join() !== state.publicInfosKeys.map(String).join();
+      this.tenantState.publicInfosKeys.map(String).join() !== state.publicInfosKeys.map(String).join() ||
+      JSON.stringify(this.tenantState.joinRequests ?? null) !== JSON.stringify(state.joinRequests ?? null);
     if (configJson === null) {
       this.dataStore.deleteTree(configKey);
     } else if (changed) {
@@ -328,7 +334,7 @@ export class MindooDatabaseObject {
         ),
     });
 
-    const config = { capabilities: {} };
+    const config: ServerConfig = { capabilities: {}, joinRequests: this.tenantState?.joinRequests };
     const syncEvents: SyncEventPublisher = {
       listenerCount: 1,
       publish: (event) => {
@@ -521,6 +527,16 @@ export class MindooDatabaseObject {
         if (!this.isDirectory) break;
         this.eventBus.publish((await request.json()) as SyncChangeEvent);
         return jsonResponse(200, { ok: true });
+      case "/internal/device-lookup": {
+        // Device discovery (server object): has this key a grant here?
+        if (!this.isDirectory) break;
+        const { signingPublicKey } = (await request.json()) as { signingPublicKey: string };
+        const state = await this.loadTenantState();
+        if (!state.exists) return jsonResponse(200, { match: null });
+        return jsonResponse(200, {
+          match: await lookupDeviceInTenant(this.tenantManager!, this.tenantId!, signingPublicKey),
+        });
+      }
       case "/internal/databases/register": {
         if (!this.isDirectory) break;
         const { dbId } = (await request.json()) as { dbId: string };
@@ -608,6 +624,7 @@ export class MindooDatabaseObject {
       route.kind !== "tenantAuth" &&
       route.kind !== "timestamp" &&
       route.kind !== "sync" &&
+      route.kind !== "joinRequest" &&
       route.kind !== "tenantNotFound"
     ) {
       return jsonResponse(404, { error: "Not found" });
@@ -615,8 +632,12 @@ export class MindooDatabaseObject {
 
     await this.loadTenantState();
     const core = this.core!;
+    const params: Record<string, string> = { tenantId: route.tenantId };
+    if (route.kind === "joinRequest" && route.id !== undefined) {
+      params[route.op === "invitation" ? "invitationId" : "requestId"] = route.id;
+    }
     const parsed = await toServerRequest(request, {
-      params: { tenantId: route.tenantId },
+      params,
       jsonBodyLimitBytes: this.settings.jsonBodyLimitBytes,
     });
     if (parsed instanceof Response) return parsed;
@@ -656,7 +677,41 @@ export class MindooDatabaseObject {
 
       case "sync":
         return this.sync(request, req, route.storeKind, route.name);
+
+      case "joinRequest":
+        return this.joinRequest(req, route.op);
     }
+  }
+
+  /**
+   * Invitation / join-request inbox (docs/invitations.md), served by the
+   * tenant's `joinrequests` object: requests are documents of that database,
+   * invitations are read from the directory replica, and the bookkeeping
+   * (used link nonces, devices per invitation) lives in this object's storage.
+   */
+  private async joinRequest(req: ServerRequest, op: JoinRequestOp): Promise<Response> {
+    const core = this.core!;
+    const run = () => {
+      switch (op) {
+        case "invitation": return core.getInvitation(req);
+        case "submit": return core.submitJoinRequest(req);
+        case "summary": return core.joinRequestSummary(req);
+        case "status": return core.joinRequestStatus(req);
+        case "withdraw": return core.withdrawJoinRequest(req);
+      }
+    };
+    await this.refreshDirectoryReplica(false);
+    let response = await run();
+    // An invitation or a member's key may have reached the directory a moment
+    // ago: refresh the replica once and retry (status reads need no directory).
+    if (
+      op !== "status" &&
+      (response.status === 403 || response.status === 404) &&
+      (await this.refreshDirectoryReplica(true))
+    ) {
+      response = await run();
+    }
+    return toResponse(response);
   }
 
   private async sync(

@@ -270,8 +270,18 @@ npm run config -- --url http://localhost:8787 get
 
 ## Differences from the Node server
 
-- **Not available:** device discovery (`/device/*`) answers `501`; Iroh
-  (neither for clients nor between peers).
+- **Not available:** Iroh (neither for clients nor between peers).
+- **Device discovery** (`/device/*`, how a device finds the tenants that
+  granted it access, e.g. after its join request was admitted) asks each
+  tenant's directory object; like on Node it looks at every tenant, so it has
+  its own tight rate limit (`MINDOODB_RATE_LIMIT_DEVICE`).
+- **Invitations and join requests** (`/<tenant>/invitations/*`,
+  `/<tenant>/join-requests/*`) are served by the tenant's `joinrequests`
+  object. The limits in `config.json` (`joinRequests`) apply, but per tenant:
+  the hourly budget per client address and the server-wide cap of pending
+  requests are counted per tenant and in memory, so they start over when the
+  object is evicted. The `MINDOODB_RATE_LIMIT_INVITE*` bindings cap bursts per
+  address across all tenants.
 - **Peer replication** pulls on the cron trigger (every minute) instead of
   keeping an event stream open to each peer, which would keep the server
   object running permanently. Pushes still go out immediately.

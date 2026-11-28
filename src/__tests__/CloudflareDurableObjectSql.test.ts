@@ -227,7 +227,14 @@ describe("Worker routing helpers", () => {
     expect(matchRoute("GET", "/acme/sync/docs/putEntries")).toEqual({ kind: "tenantNotFound", tenantId: "acme" });
     expect(matchRoute("GET", "/system/peer/events")).toEqual({ kind: "peer", path: "/system/peer/events" });
     expect(matchRoute("GET", "/system/cluster/status")).toEqual({ kind: "system", path: "/system/cluster/status" });
-    expect(matchRoute("POST", "/device/challenge")).toMatchObject({ kind: "unsupported" });
+    expect(matchRoute("POST", "/device/challenge")).toEqual({ kind: "device", step: "challenge" });
+    expect(matchRoute("POST", "/device/discover")).toEqual({ kind: "device", step: "discover" });
+    expect(matchRoute("GET", "/device/discover")).toEqual({ kind: "notFound" });
+    expect(matchRoute("GET", "/t1/invitations/inv_A")).toEqual({ kind: "joinRequest", tenantId: "t1", op: "invitation", id: "inv_A" });
+    expect(matchRoute("POST", "/t1/join-requests")).toEqual({ kind: "joinRequest", tenantId: "t1", op: "submit" });
+    expect(matchRoute("POST", "/t1/join-requests/summary")).toEqual({ kind: "joinRequest", tenantId: "t1", op: "summary" });
+    expect(matchRoute("GET", "/t1/join-requests/jr_X")).toEqual({ kind: "joinRequest", tenantId: "t1", op: "status", id: "jr_X" });
+    expect(matchRoute("POST", "/t1/join-requests/jr_X/withdraw")).toEqual({ kind: "joinRequest", tenantId: "t1", op: "withdraw", id: "jr_X" });
     expect(matchRoute("DELETE", "/system/tenants/acme")).toEqual({ kind: "system", path: "/system/tenants/acme" });
   });
 

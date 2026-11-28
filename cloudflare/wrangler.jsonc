@@ -37,7 +37,12 @@
     { "name": "MINDOODB_RATE_LIMIT_SYNC", "namespace_id": "4803", "simple": { "limit": 3000, "period": 60 } },
     { "name": "MINDOODB_RATE_LIMIT_SYSTEM", "namespace_id": "4804", "simple": { "limit": 30, "period": 60 } },
     { "name": "MINDOODB_RATE_LIMIT_TIMESTAMP", "namespace_id": "4805", "simple": { "limit": 10, "period": 60 } },
-    { "name": "MINDOODB_RATE_LIMIT_PEER", "namespace_id": "4806", "simple": { "limit": 600, "period": 60 } }
+    { "name": "MINDOODB_RATE_LIMIT_PEER", "namespace_id": "4806", "simple": { "limit": 600, "period": 60 } },
+    // Invitation reads / join requests and the status polls of waiting devices.
+    { "name": "MINDOODB_RATE_LIMIT_INVITE", "namespace_id": "4807", "simple": { "limit": 30, "period": 60 } },
+    { "name": "MINDOODB_RATE_LIMIT_INVITE_STATUS", "namespace_id": "4808", "simple": { "limit": 240, "period": 60 } },
+    // Device discovery (/device/*) scans every tenant.
+    { "name": "MINDOODB_RATE_LIMIT_DEVICE", "namespace_id": "4809", "simple": { "limit": 10, "period": 60 } }
   ],
 
   // Peer replication pass every minute (runs only when config.json sets

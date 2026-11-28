@@ -40,6 +40,7 @@ import {
 import type { ExecutionContext, MindooCloudflareEnv } from "./types";
 
 const DIRECTORY_DB_ID = "directory";
+const JOIN_REQUESTS_DB_ID = "joinrequests";
 
 /** Copy of the request for an object, with internal headers set and client-supplied ones dropped. */
 function forward(
@@ -105,6 +106,18 @@ async function handle(
     case "publicInfosFingerprints":
       return serverObject(env).fetch(forward(request, url, null, internal));
 
+    case "device": {
+      // Discovery scans every tenant's directory; budget per address as on Node.
+      const limited = await rateLimited(
+        env.MINDOODB_RATE_LIMIT_DEVICE,
+        `device:${clientAddressKey(clientIp)}`,
+        "Too many device discovery requests, please try again later",
+      );
+      if (limited) return limited;
+      const body = request.body ? new Uint8Array(await request.arrayBuffer()) : null;
+      return serverObject(env).fetch(forward(request, url, body, internal));
+    }
+
     case "peer":
     case "system": {
       // Peer routes are server-to-server traffic with their own budget, as on
@@ -147,6 +160,26 @@ async function handle(
         [OBJECT_HEADER.dbId]: dbId,
       }),
     );
+
+  if (route.kind === "joinRequest") {
+    // Unauthenticated (the joining device has no grant yet), so budgeted per
+    // address as on Node; waiting devices poll their status with a wider one.
+    const limited = route.op === "status"
+      ? await rateLimited(
+          env.MINDOODB_RATE_LIMIT_INVITE_STATUS,
+          `invite-status:${clientAddressKey(clientIp)}`,
+          "Too many requests, please try again later",
+        )
+      : await rateLimited(
+          env.MINDOODB_RATE_LIMIT_INVITE,
+          `invite:${clientAddressKey(clientIp)}`,
+          "Too many requests, please try again later",
+        );
+    if (limited) return limited;
+    // The inbox writes to the tenant's `joinrequests` database and reads
+    // invitations from its directory replica.
+    return toObject(JOIN_REQUESTS_DB_ID);
+  }
 
   if (route.kind !== "sync") {
     return toObject(DIRECTORY_DB_ID);
