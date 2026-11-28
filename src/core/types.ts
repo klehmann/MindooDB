@@ -1552,6 +1552,19 @@ export interface StoreEntryAttachmentRef {
  * This contains all information except the actual encrypted payload,
  * making it efficient for synchronization negotiations.
  */
+/** A document's signed and decrypted changes, from `MindooDB.getDocumentPayloads()`. */
+export interface MindooDocumentPayloads {
+  docId: string;
+  /** Automerge changes in store order (`Automerge.loadIncremental` each, or `applyChanges` in slices). */
+  changes: Uint8Array[];
+  /** The key a lifecycle change for this document is encrypted with. */
+  decryptionKeyId: string;
+  /** The document's current Automerge heads; a lifecycle change builds on exactly these. */
+  heads: string[];
+  /** What loading it costs (`estimateDocumentLoad`), or null when a change could not be read. */
+  estimate: import("./documentLoadGuard").DocumentLoadEstimate | null;
+}
+
 export interface StoreEntryMetadata {
   /**
    * The type of this entry, indicating what kind of data it contains.
@@ -6119,6 +6132,26 @@ export interface MindooDB {
    * @return A promise that resolves when the document is deleted
    */
   deleteDocument(docId: string, options?: DeleteOptions): Promise<void>;
+
+  /**
+   * The signed and decrypted Automerge changes of a document, without loading
+   * it, for documents too large to load in this process
+   * (`DocumentTooLargeError`): load them in an Automerge instance that may fail
+   * on its own, e.g. in a worker. Snapshots are left out. Throws while the
+   * tenant enforces access control; `null` for an unknown document.
+   */
+  getDocumentPayloads?(docId: string): Promise<MindooDocumentPayloads | null>;
+
+  /**
+   * Deletes a document this process cannot load, from a lifecycle change built
+   * on top of its current heads that touches only `_lastModified` and
+   * `_attachments` (checked). See {@link getDocumentPayloads}.
+   */
+  deleteDocumentWithChange?(
+    docId: string,
+    lifecycleChange: Uint8Array,
+    options?: { documentUsernameHash?: string | null; attribution?: ChangeAttributionInput },
+  ): Promise<void>;
 
   /**
    * Bulk-delete documents in a single append-only store write.

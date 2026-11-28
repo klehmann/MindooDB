@@ -5,7 +5,11 @@ import { MindooFilingStore, type FilingStoreOptions } from "./filing/MindooFilin
 import type { FilingIndex } from "./filing/FilingIndex";
 import { Automerge } from "./automerge-adapter";
 import { applyChangesInSlices } from "./applyChangesInSlices";
-import { assertDocumentLoadWithinBudget, isDocumentTooLargeError } from "./documentLoadGuard";
+import {
+  assertDocumentLoadWithinBudget,
+  estimateDocumentLoad,
+  isDocumentTooLargeError,
+} from "./documentLoadGuard";
 import { ChangeDocDraft, diffTextSplice, fieldTypeOf, type DraftOp } from "./ChangeDocDraft";
 import {
   LARGE_STRING_ATOMIC_THRESHOLD,
@@ -65,6 +69,7 @@ import {
   ConflictScanCheckpoint,
   MindooDoc,
   MindooDocPayload,
+  MindooDocumentPayloads,
   MindooFieldType,
   StoreEntry,
   StoreEntryMetadata,
@@ -10686,6 +10691,167 @@ export class BaseMindooDB implements MindooDB {
       options.bypassAccessControlPrecheck,
       options.attribution,
     );
+  }
+
+  /**
+   * The signed and decrypted Automerge changes of a document, without loading
+   * it: every `doc_create`, `doc_change`, `doc_delete` and `doc_undelete` entry
+   * whose signature verifies, decrypted, in store order. Snapshots are left
+   * out, so nothing here has to be trusted beyond the signed entries.
+   *
+   * For documents this process refuses to load (`DocumentTooLargeError`):
+   * hand the changes to an Automerge instance that may fail on its own, such
+   * as one in a worker, to read the document there.
+   *
+   * Not available while the tenant enforces access control, where each change
+   * is judged against the document state it produces. Returns `null` for an
+   * unknown document.
+   */
+  async getDocumentPayloads(docId: string): Promise<MindooDocumentPayloads | null> {
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    if (allEntryMetadata.length === 0) return null;
+    await this.ingestSealedKeyFromEntries(allEntryMetadata);
+    if (await this.isAclEnforced()) {
+      throw new Error(
+        `Document ${docId} cannot be read without loading it while access control is enforced`,
+      );
+    }
+    const replay = allEntryMetadata
+      .filter((meta) => this.isDocumentReplayEntry(meta))
+      .sort((a, b) =>
+        (a.receivedAt ?? a.createdAt) === (b.receivedAt ?? b.createdAt)
+          ? a.id.localeCompare(b.id)
+          : (a.receivedAt ?? a.createdAt) - (b.receivedAt ?? b.createdAt),
+      );
+    const fetched = await this.fetchEntries(replay.map((meta) => meta.id));
+    const byId = new Map(fetched.map((entry) => [entry.id, entry]));
+    const changes: Uint8Array[] = [];
+    let decryptionKeyId: string | null = null;
+    for (const meta of replay) {
+      const entry = byId.get(meta.id);
+      if (!entry) continue;
+      if (await this.shouldSkipLoadedEntryForBuiltin(entry)) continue;
+      if (!(await this.verifyEntrySignatureForDb(entry, entry.encryptedData))) {
+        this.logger.warn(`Invalid signature for entry ${entry.id}, skipping`);
+        continue;
+      }
+      changes.push(await this.tenant.decryptPayload(entry.encryptedData, entry.decryptionKeyId));
+      if (meta.entryType === "doc_create" || decryptionKeyId === null) {
+        decryptionKeyId = entry.decryptionKeyId;
+      }
+    }
+    if (changes.length === 0) return null;
+    return {
+      docId,
+      changes,
+      decryptionKeyId: decryptionKeyId ?? replay[0].decryptionKeyId,
+      heads: this.replayHeads(replay),
+      estimate: estimateDocumentLoad(null, changes),
+    };
+  }
+
+  /**
+   * Deletes a document this process cannot load, from a lifecycle change built
+   * elsewhere (see {@link getDocumentPayloads}): an Automerge change on top of
+   * the document's current heads that touches nothing but `_lastModified` and
+   * `_attachments` at the root, as `deleteDocument()` would write it. The
+   * change is checked for exactly that before it is signed, encrypted and
+   * stored as a `doc_delete` entry; the body stays in the history, as with
+   * every delete.
+   *
+   * `documentUsernameHash` is the document's `username_hash` field, if any
+   * (the built-in user databases decide who may delete by it).
+   */
+  async deleteDocumentWithChange(
+    docId: string,
+    lifecycleChange: Uint8Array,
+    options: { documentUsernameHash?: string | null; attribution?: ChangeAttributionInput } = {},
+  ): Promise<void> {
+    this.assertWritable("deleteDocumentWithChange");
+    const allEntryMetadata = await this.scanAllMetadata(this.store, { docId });
+    const replay = allEntryMetadata.filter((meta) => this.isDocumentReplayEntry(meta));
+    if (replay.length === 0) throw new DocumentNotFoundError(docId);
+    if (await this.isAclEnforced()) {
+      throw new Error(`Document ${docId} cannot be deleted without loading it while access control is enforced`);
+    }
+    const latest = [...replay].sort((a, b) => a.createdAt - b.createdAt).at(-1)!;
+    if (latest.entryType === "doc_delete") return; // already deleted
+
+    const decoded = Automerge.decodeChange(lifecycleChange);
+    const heads = this.replayHeads(replay);
+    const deps = [...(decoded.deps ?? [])].sort();
+    if (deps.length !== heads.length || deps.some((dep, index) => dep !== [...heads].sort()[index])) {
+      throw new Error(`The delete change for ${docId} does not build on the document's current heads`);
+    }
+    const allowedKeys = new Set(["_lastModified", "_attachments"]);
+    for (const op of decoded.ops ?? []) {
+      if (op.obj !== "_root" || typeof op.key !== "string" || !allowedKeys.has(op.key)) {
+        throw new Error(`The delete change for ${docId} touches more than _lastModified and _attachments`);
+      }
+    }
+
+    await this.assertLifecycleMutationAllowed(
+      "doc_delete",
+      undefined,
+      undefined,
+      options.documentUsernameHash ?? null,
+      docId,
+    );
+    const createMeta = replay.find((meta) => meta.entryType === "doc_create") ?? replay[0];
+    const decryptionKeyId = createMeta.decryptionKeyId;
+    const now = semanticNow();
+    const automergeHash = decoded.hash;
+    const encryptedPayload = await this.tenant.encryptPayload(lifecycleChange, decryptionKeyId);
+    const contentHash = await computeContentHash(encryptedPayload, this.getSubtle());
+    const entryId = await generateDocEntryId(docId, automergeHash, decoded.deps ?? [], this.getSubtle());
+    const dependencyIds = await this.ensureAutomergeDepsResolved(docId, decoded.deps ?? []);
+    const currentUser = await this.tenant.getCurrentUserId();
+    const signature = await this.tenant.signPayload(encryptedPayload);
+    const entryMetadata: StoreEntryMetadata = {
+      entryType: "doc_delete",
+      id: entryId,
+      contentHash,
+      docId,
+      dependencyIds,
+      createdAt: now,
+      createdByPublicKey: currentUser.userSigningPublicKey,
+      decryptionKeyId,
+      signature,
+      originalSize: lifecycleChange.length,
+      encryptedSize: encryptedPayload.length,
+      entryVersion: CURRENT_STORE_ENTRY_VERSION,
+    };
+    entryMetadata.metadataSignature = await this.computeEntryMetadataSignature(entryMetadata);
+    await this.putLocalEntries([{ ...entryMetadata, encryptedData: encryptedPayload }]);
+    this.registerAutomergeHashMapping(docId, automergeHash, entryId);
+    this.docCache.delete(docId);
+    this.dirtyDocIds.delete(docId);
+    const awaitingWitness = isProvisional(entryMetadata);
+    this.updateIndex(
+      docId,
+      now,
+      true,
+      decryptionKeyId,
+      "visible",
+      awaitingWitness,
+      isVersioned(entryMetadata) && !awaitingWitness,
+      true,
+    );
+    this.cacheMetaDirty = true;
+    this.cacheManager?.markDirty();
+    this.logger.info(`Document ${docId} deleted from a prepared change`);
+  }
+
+  /** Automerge hashes of the replay entries nothing else depends on: the document's heads. */
+  private replayHeads(replay: StoreEntryMetadata[]): string[] {
+    const dependedOn = new Set(replay.flatMap((meta) => meta.dependencyIds));
+    const heads: string[] = [];
+    for (const meta of replay) {
+      if (dependedOn.has(meta.id)) continue;
+      const parsed = parseDocEntryId(meta.id);
+      if (parsed) heads.push(parsed.automergeHash);
+    }
+    return heads;
   }
 
   /**
