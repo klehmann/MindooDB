@@ -183,6 +183,7 @@ import {
   isSymmetricKeyNotFound,
   SymmetricKeyNotFoundError,
 } from "./errors";
+import { withScopedSealedKeys } from "./userkeys/scopedSealedKeys";
 import {
   buildEntrySigningBytes,
   entrySignatureFieldsFromEntry,
@@ -697,6 +698,8 @@ const CHANGE_SEQ_RESTORE_JUMP = 2 ** 30;
 
 export class BaseMindooDB implements MindooDB {
   private tenant: BaseMindooTenant;
+  /** The tenant as passed in, for {@link getTenant}; {@link tenant} is its sealed-scoped view. */
+  private readonly ownerTenant: BaseMindooTenant;
   private store: ContentAddressedStore;
   private attachmentStore: ContentAddressedStore;
   /**
@@ -1169,7 +1172,10 @@ export class BaseMindooDB implements MindooDB {
         `[BaseMindooDB] Expected attachment store kind ${StoreKind.attachments} but received ${attachmentStore.getStoreKind()}`,
       );
     }
-    this.tenant = tenant;
+    // Sealed key series are named after a document id, which is unique per
+    // database only: keep this database's series apart in the session cache.
+    this.ownerTenant = tenant;
+    this.tenant = withScopedSealedKeys(tenant, store.getId());
     this.store = store;
     this.attachmentStore = attachmentStore;
     this.chunkSizeBytes =
@@ -5973,7 +5979,7 @@ export class BaseMindooDB implements MindooDB {
   }
 
   getTenant(): MindooTenant {
-    return this.tenant;
+    return this.ownerTenant;
   }
 
   async createDocument(options?: CreateOptions): Promise<MindooDoc> {

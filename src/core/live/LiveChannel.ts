@@ -20,6 +20,7 @@
  *
  * @module LiveChannel
  */
+import { scopeSealedKeyId } from "../userkeys/scopedSealedKeys";
 import { base64ToBytes, bytesToBase64 } from "../utils/base64";
 import type { MindooTenant } from "../types";
 
@@ -80,9 +81,18 @@ const decoder = new TextDecoder();
 export function openLiveChannel(
   tenant: MindooTenant,
   transport: LiveTransport,
-  options: { keyId: string; now?: () => number },
+  options: {
+    keyId: string;
+    /**
+     * The database the key belongs to. Needed for a group key
+     * (`$sealed:<groupDocId>`): the session keeps sealed series per database.
+     */
+    dbId?: string;
+    now?: () => number;
+  },
 ): LiveChannel {
   const now = options.now ?? Date.now;
+  const keyId = options.dbId ? scopeSealedKeyId(options.keyId, options.dbId) : options.keyId;
   const messageHandlers = new Set<(message: LiveMessage) => void>();
   const stateHandlers = new Set<(state: LiveChannelState) => void>();
   let state: LiveChannelState = "connecting";
@@ -114,7 +124,7 @@ export function openLiveChannel(
       if (!keys.includes(envelope.k)) {
         return;
       }
-      const message = JSON.parse(decoder.decode(await tenant.decryptPayload(ciphertext, options.keyId))) as {
+      const message = JSON.parse(decoder.decode(await tenant.decryptPayload(ciphertext, keyId))) as {
         t?: unknown;
         d?: unknown;
         at?: unknown;
@@ -163,7 +173,7 @@ export function openLiveChannel(
       if (plain.length > LIVE_MAX_MESSAGE_BYTES) {
         throw new Error(`A live message can be at most ${LIVE_MAX_MESSAGE_BYTES} bytes.`);
       }
-      const ciphertext = await tenant.encryptPayload(plain, options.keyId);
+      const ciphertext = await tenant.encryptPayload(plain, keyId);
       const signature = await tenant.signPayload(ciphertext);
       const envelope: Envelope = {
         v: 1,
