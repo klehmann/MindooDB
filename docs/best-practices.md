@@ -670,9 +670,19 @@ MindooDB guards against this in two ways:
   operation per character and kept the old one in the history; twenty
   rewrites of a 1 MB field loaded with about 2.5 GB.
 
+What a load needs at its peak is mostly the working memory of one step, not
+the size of the document: an `applyChanges` call needs about 500 bytes per
+operation and 1.5 KB per change while it runs, and what stays afterwards is
+about 6 bytes per operation and 300 bytes per change. MindooDB therefore
+applies changes in steps of at most 2 MB and 500,000 operations: 12 million
+characters of text then load with about 220 MB instead of 1.1 GB. What remains
+dangerous is a single change with millions of operations (a huge text pasted in
+one go), which cannot be split.
+
 A host can also cap what one document load may cost with
 `setDocumentLoadBudget(bytes)`: MindooDB counts the operations in the stored
-snapshot and changes from their binary headers (no load needed) and throws
+snapshot and changes from their binary headers (no load needed), estimates the
+load as what stays plus its most expensive step, and throws
 `DocumentTooLargeError` instead of loading a document whose estimate exceeds
 the budget. Keep documents that receive many changes snapshotted, too: replayed
 one entry at a time, many small changes cost time rather than memory

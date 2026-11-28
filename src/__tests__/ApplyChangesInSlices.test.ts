@@ -1,6 +1,6 @@
 import * as Automerge from "@automerge/automerge";
 
-import { applyChangesInSlices } from "../core/applyChangesInSlices";
+import { applyChangesInSlices, planChangeSlices } from "../core/applyChangesInSlices";
 
 type Workspace = { apps: Record<string, { profile: string; updatedAt: string }> };
 
@@ -24,6 +24,15 @@ function bigRewrites(size: number, count: number) {
 const heavy = process.env.MINDOODB_HEAVY_TESTS === "1" ? it : it.skip;
 
 describe("applyChangesInSlices", () => {
+  it("bounds a slice by operations as well as by bytes", () => {
+    const { base, doc, changes } = bigRewrites(1000, 12);
+    // Large byte budget, 2,500 operations: each rewrite (about 2,000 ops) gets its own slice.
+    expect(planChangeSlices(changes, 64 * 1024 * 1024, 2500)).toHaveLength(12);
+    expect(planChangeSlices(changes, 64 * 1024 * 1024, 100_000)).toHaveLength(1);
+    const applied = applyChangesInSlices(Automerge.clone(base), changes, 64 * 1024 * 1024, 2500);
+    expect(applied.apps.app.profile).toBe(doc.apps.app.profile);
+  });
+
   it("applies small batches in one go and gives the same document", () => {
     const { base, doc, changes } = bigRewrites(100, 5);
     const applied = applyChangesInSlices(Automerge.clone(base), changes);
